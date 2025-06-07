@@ -268,23 +268,35 @@ def attend():
 
 @app.route("/start")
 def start():
-    username = request.args.get('user', '')
-    userid = request.args.get('id', '')
-    now = datetime.now()
+    try:
+        username = request.args.get('user', '')
+        userid = request.args.get('id', '')
+        now = datetime.now()
 
-    # Check if session already active
-    sessions = safe_get_all_records(sessions_sheet)
-    for session in sessions:
-        if str(session['UserID']) == str(userid):
-            return f"⚠️ {username}, session already active! Use !stop first."
+        # Check if session already active
+        sessions = safe_get_all_records(sessions_sheet)
+        for session in sessions:
+            if str(session.get('UserID')) == str(userid):
+                return f"⚠️ {username}, session already active! Use !stop first."
 
-    # Create new session
-    sessions_sheet.append_row([
-        userid, username, now.strftime("%Y-%m-%d %H:%M:%S"),
-        now.strftime("%Y-%m-%d %H:%M:%S"), "Active", "", 0
-    ])
-    
-    return f"⏱️ {username}, study session started! Use !stop to end. 📚"
+        # Create new session with correct order
+        new_row = [
+            userid,                              # UserID
+            username,                            # Username
+            now.strftime("%Y-%m-%d %H:%M:%S"),   # StartTime
+            now.strftime("%Y-%m-%d %H:%M:%S"),   # LastActivity
+            "Active",                            # Status
+            "",                                  # BreakEndTime
+            0                                    # TotalBreakTime
+        ]
+        sessions_sheet.append_row(new_row)
+        print(f"[START] New session row added: {new_row}")
+
+        return f"⏱️ {username}, study session started! Use !stop to end. 📚"
+
+    except Exception as e:
+        print(f"[ERROR in /start] {e}")
+        return "❌ Failed to start session. Try again.", 500
 
 @app.route("/stop")
 def stop():
@@ -293,24 +305,20 @@ def stop():
         userid = request.args.get('id', '')
         now = datetime.now()
 
-        print(f"[STOP] Called by user: {username}, ID: {userid}")
-
         sessions = safe_get_all_records(sessions_sheet)
 
         for i, session in enumerate(sessions):
             if str(session.get('UserID')) == str(userid):
-                print(f"[STOP] Found session for {userid}")
-
                 start_str = session.get('StartTime')
-                if not start_str:
-                    print("[ERROR] StartTime is missing in session.")
-                    return "❌ Error: StartTime missing.", 500
+                if not start_str or not start_str.strip():
+                    print(f"[ERROR] Missing StartTime for user {userid}")
+                    return f"⚠️ {username}, session has no start time. Use !start again.", 500
 
                 try:
                     start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
                 except Exception as e:
                     print(f"[ERROR] Bad StartTime format: {e}")
-                    return "❌ Error: Bad StartTime format.", 500
+                    return "❌ Error: Invalid StartTime format.", 500
 
                 duration_minutes = int((now - start_time).total_seconds() / 60)
 
@@ -323,22 +331,23 @@ def stop():
                 study_minutes = max(0, duration_minutes - break_time)
                 xp_earned = study_minutes * 2
 
-                row_to_add = [
-                    now.strftime("%Y-%m-%d %H:%M:%S"),
-                    userid,
-                    username,
-                    "StudySession",
-                    xp_earned,
-                    f"{study_minutes} min",
-                    f"Studied for {study_minutes} minutes",
-                    now.strftime("%Y-%m")
-                ]
+                # Log in activities sheet
+                activities_sheet.append_row([
+                    now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+                    userid,                             # UserID
+                    username,                           # Username
+                    "StudySession",                     # Action
+                    xp_earned,                          # XPEarned
+                    f"{study_minutes} min",            # Duration
+                    f"Studied for {study_minutes} minutes",  # Details
+                    now.strftime("%Y-%m")               # Month
+                ])
+                print(f"[STOP] Logged to activities: {username}, {study_minutes}min")
 
-                print(f"[STOP] Writing to activities_sheet: {row_to_add}")
-                activities_sheet.append_row(row_to_add)
-
-                print(f"[STOP] Updating XP and deleting session row")
+                # Update XP
                 update_user_xp(userid, xp_earned)
+
+                # Delete session row
                 sessions_sheet.delete_rows(i + 2)
 
                 badges = get_badges(study_minutes)
@@ -346,12 +355,12 @@ def stop():
 
                 return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
 
-        print("[STOP] No active session found")
         return f"⚠️ {username}, no active session found. Use !start first."
 
     except Exception as e:
-        print(f"[ERROR in /stop route] {e}")
-        return "❌ Server error while stopping session. Please try again.", 500
+        print(f"[ERROR in /stop] {e}")
+        return "❌ Failed to stop session. Please try again.", 500
+
 
 
 @app.route("/working")
