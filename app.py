@@ -42,6 +42,18 @@ plans_sheet = workbook.worksheet("Plans")
 HF_API_URL = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium"
 HF_HEADERS = {"Authorization": "Bearer YOUR_HF_TOKEN"}  # Replace with your HF token
 
+def get_sessions_with_headers():
+    """Returns all rows from Sessions sheet with headers, padding missing cells."""
+    rows = sessions_sheet.get_all_values()
+    if len(rows) < 2:
+        return []
+    headers = rows[0]
+    return [
+        dict(zip(headers, row + [''] * (len(headers) - len(row))))
+        for row in rows[1:]
+    ]
+
+
 def safe_get_all_records(sheet):
     try:
         values = sheet.get_all_values()
@@ -273,22 +285,21 @@ def start():
         userid = request.args.get('id', '')
         now = datetime.now()
 
-        # Check if session already active
-        sessions = safe_get_all_records(sessions_sheet)
+        sessions = get_sessions_with_headers()
         for session in sessions:
             if str(session.get('UserID')) == str(userid):
                 return f"⚠️ {username}, session already active! Use !stop first."
 
-        # Create new session with correct order
         new_row = [
-            userid,                              # UserID
-            username,                            # Username
-            now.strftime("%Y-%m-%d %H:%M:%S"),   # StartTime
-            now.strftime("%Y-%m-%d %H:%M:%S"),   # LastActivity
-            "Active",                            # Status
-            "",                                  # BreakEndTime
-            0                                    # TotalBreakTime
+            userid,
+            username,
+            now.strftime("%Y-%m-%d %H:%M:%S"),  # StartTime
+            now.strftime("%Y-%m-%d %H:%M:%S"),  # LastActivity
+            "Active",
+            "",
+            0
         ]
+
         sessions_sheet.append_row(new_row)
         print(f"[START] New session row added: {new_row}")
 
@@ -298,6 +309,7 @@ def start():
         print(f"[ERROR in /start] {e}")
         return "❌ Failed to start session. Try again.", 500
 
+
 @app.route("/stop")
 def stop():
     try:
@@ -305,22 +317,21 @@ def stop():
         userid = request.args.get('id', '')
         now = datetime.now()
 
-        sessions = safe_get_all_records(sessions_sheet)
+        sessions = get_sessions_with_headers()
 
         for i, session in enumerate(sessions):
             if str(session.get('UserID')) != str(userid):
-                continue  # Skip other users
+                continue
 
-            # Skip rows missing StartTime
             start_str = session.get('StartTime', '').strip()
             if not start_str:
-                print(f"[WARN] Skipping session row with missing StartTime at row {i+2}")
+                print(f"[WARN] Skipping session with missing StartTime at row {i+2}")
                 continue
 
             try:
                 start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
             except Exception as e:
-                print(f"[WARN] Bad StartTime format: {start_str} — {e}")
+                print(f"[WARN] Bad StartTime format at row {i+2}: {start_str} — {e}")
                 continue
 
             duration_minutes = int((now - start_time).total_seconds() / 60)
@@ -333,7 +344,6 @@ def stop():
             study_minutes = max(0, duration_minutes - break_time)
             xp_earned = study_minutes * 2
 
-            # Log to activities
             activities_sheet.append_row([
                 now.strftime("%Y-%m-%d %H:%M:%S"),
                 userid,
@@ -344,6 +354,7 @@ def stop():
                 f"Studied for {study_minutes} minutes",
                 now.strftime("%Y-%m")
             ])
+
             update_user_xp(userid, xp_earned)
             sessions_sheet.delete_rows(i + 2)
 
@@ -356,7 +367,8 @@ def stop():
 
     except Exception as e:
         print(f"[ERROR in /stop] {e}")
-        return "❌ Failed to stop session. Try again.", 500
+        return "❌ Failed to stop session. Please try again.", 500
+
 
 
 
