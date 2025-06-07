@@ -845,14 +845,21 @@ def progress_report():
 @attendance_required
 def ai_assistant():
     username = request.args.get('user')
-    userid = request.args.get('id')
     question = request.args.get('msg') or ""
     
     if not question:
-        return f"⚠️ {username}, please ask a question. Example: !ai Explain quantum physics basics"
+        return f"⚠️ {username}, ask like: !ai explain quantum physics"
     
+    if len(question) < 5:
+        return f"📝 {username}, please ask a longer question (min 5 chars)"
+        
     response = query_ai(question)
-    return f"🤖 {username}, AI response:\n{response}"
+    
+    # Truncate to chat limits
+    if len(response) > 200:
+        response = response[:197] + "..."
+        
+    return f"🤖 {username}: {response}"
 
 # !working
 @app.route("/working")
