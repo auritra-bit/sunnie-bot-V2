@@ -218,7 +218,7 @@ def parse_time_from_text(text):
 def send_reminder(reminder_id):
     """Send scheduled reminder"""
     try:
-        reminders = reminders_sheet.get_all_records()
+        reminders = safe_get_all_records(reminders_sheet)
         for i, reminder in enumerate(reminders):
             if reminder['ReminderID'] == reminder_id and reminder['Status'] == 'Pending':
                 # Mark as sent
