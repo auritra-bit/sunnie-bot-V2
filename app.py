@@ -51,7 +51,7 @@ except gspread.WorksheetNotFound:
     penalties_sheet.append_row(["Timestamp", "UserID", "Username", "PenaltyXP", "Reason"])
 
 # AI Configuration (Using free Hugging Face API)
-HF_API_URL = "https://api-inference.huggingface.co/models/EleutherAI/gpt-neo-1.3B"
+HF_API_URL = "https://api-inference.huggingface.co/models/EleutherAI/gpt-neo-125M"
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
 
 # === Helper Functions ===
