@@ -130,9 +130,6 @@ if os.path.exists(YOUTUBE_CLIENT_SECRET) or os.getenv('YOUTUBE_CLIENT_SECRET_JSO
     except Exception as e:
         print(f"❌ YouTube API init failed: {str(e)}")
 
-# ========== Start monitoring chat in background ==========
-if youtube_service:
-    threading.Thread(target=monitor_chat, daemon=True).start()
 
 def send_message(live_chat_id, text):
     youtube_service.liveChatMessages().insert(
@@ -188,6 +185,10 @@ def monitor_chat():
 
     except Exception as e:
         print(f"❌ Error in monitor_chat: {e}")
+
+# ========== Start monitoring chat in background ==========
+if youtube_service:
+    threading.Thread(target=monitor_chat, daemon=True).start()
 
 
 # ========== Core Bot Functionality ==========
