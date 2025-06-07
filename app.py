@@ -116,9 +116,10 @@ def parse_time_input(time_str):
     # Default to 50 minutes
     return now + timedelta(minutes=50)
 
+# Replace your query_ai function with this improved version
 def query_ai(prompt, max_length=200):
     if not HF_API_TOKEN:
-        return "AI service is currently unavailable. Please try again later."
+        return "⚠️ AI service is currently offline. Please try later."
     
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
     payload = {
@@ -126,17 +127,32 @@ def query_ai(prompt, max_length=200):
         "parameters": {
             "max_length": max_length,
             "temperature": 0.7,
-            "do_sample": True
+            "do_sample": True,
+            "max_time": 10  # Timeout after 10 seconds
         }
     }
+    
     try:
-        response = requests.post(HF_API_URL, headers=headers, json=payload)
-        if response.status_code == 200:
-            return response.json()[0]['generated_text'].strip()
-        return "AI is busy. Please try again in a minute."
+        # Try twice with delay
+        for attempt in range(2):
+            response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=15)
+            
+            if response.status_code == 200:
+                return response.json()[0]['generated_text'].strip()
+            
+            # Handle model loading
+            if response.status_code == 503:
+                wait_time = response.json().get('estimated_time', 10)
+                time.sleep(wait_time + 2)  # Wait a bit longer than estimated
+                continue
+                
+        return "⏳ AI is overloaded! Please try again in 30 seconds."
+    
+    except requests.exceptions.Timeout:
+        return "⌛ AI response timed out. Try a simpler question!"
     except Exception as e:
         print(f"AI Error: {str(e)}")
-        return "AI service error. Try again later."
+        return "❌ AI glitch! Please try again later."
 
 def apply_penalty(userid, username, xp_deduction, reason):
     """Apply XP penalty to a user"""
