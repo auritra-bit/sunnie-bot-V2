@@ -305,11 +305,12 @@ def stop():
             xp_earned = study_minutes * 2
 
             # Log study session
-            sessions_sheet.append_row([
+            activities_sheet.append_row([
                 now.strftime("%Y-%m-%d %H:%M:%S"), userid, username,
                 "StudySession", xp_earned, f"{study_minutes} min",
                 f"Studied for {study_minutes} minutes", now.strftime("%Y-%m")
             ])
+
             
             # Update user data
             update_user_xp(userid, xp_earned)
