@@ -1,16 +1,23 @@
-from flask import Flask, request
+from flask import Flask, request, jsonify
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 import time
-from threading import Thread
+from threading import Thread, Lock
 import os
-import requests
 import re
-import pytz
-import random
+import requests
+import json
+from apscheduler.schedulers.background import BackgroundScheduler
+import uuid
 
 app = Flask(__name__)
+
+# Track active sessions and background scheduler
+sessions = {}
+session_lock = Lock()
+scheduler = BackgroundScheduler()
+scheduler.start()
 
 # === Google Sheet Setup ===
 SERVICE_ACCOUNT_FILE = "/etc/secrets/credentials.json"
@@ -18,873 +25,1071 @@ scope = [
     'https://spreadsheets.google.com/feeds',
     'https://www.googleapis.com/auth/drive'
 ]
-creds = ServiceAccountCredentials.from_json_keyfile_name(SERVICE_ACCOUNT_FILE, scope)
-client = gspread.authorize(creds)
+client = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+workbook = client.open("StudyPlusData")
 
-# Open spreadsheet and worksheets
-spreadsheet = client.open("StudyPlusData")
-main_sheet = spreadsheet.sheet1
+# Access different sheets
+users_sheet = workbook.worksheet("Users")
+sessions_sheet = workbook.worksheet("Sessions") 
+activities_sheet = workbook.worksheet("Activities")
+tasks_sheet = workbook.worksheet("Tasks")
+goals_sheet = workbook.worksheet("Goals")
+reminders_sheet = workbook.worksheet("Reminders")
+reports_sheet = workbook.worksheet("Reports")
+plans_sheet = workbook.worksheet("Plans")
 
-# Get or create additional sheets
-try:
-    reports_sheet = spreadsheet.worksheet("Reports")
-except gspread.WorksheetNotFound:
-    reports_sheet = spreadsheet.add_worksheet("Reports", 100, 5)
-    reports_sheet.append_row(["Timestamp", "Reporter", "Reported User", "Reason", "Resolved"])
+# === Free AI API Setup (Using Hugging Face Inference API) ===
+HF_API_URL = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium"
+HF_HEADERS = {"Authorization": "Bearer YOUR_HF_TOKEN"}  # Replace with your HF token
 
-try:
-    sessions_sheet = spreadsheet.worksheet("ActiveSessions")
-except gspread.WorksheetNotFound:
-    sessions_sheet = spreadsheet.add_worksheet("ActiveSessions", 100, 6)
-    sessions_sheet.append_row(["UserID", "Username", "StartTime", "LastActive", "Status", "Warnings"])
-
-try:
-    reminders_sheet = spreadsheet.worksheet("Reminders")
-except gspread.WorksheetNotFound:
-    reminders_sheet = spreadsheet.add_worksheet("Reminders", 100, 6)
-    reminders_sheet.append_row(["UserID", "Username", "ReminderTime", "Message", "Triggered", "OriginalTime"])
-
-try:
-    penalties_sheet = spreadsheet.worksheet("Penalties")
-except gspread.WorksheetNotFound:
-    penalties_sheet = spreadsheet.add_worksheet("Penalties", 100, 5)
-    penalties_sheet.append_row(["Timestamp", "UserID", "Username", "PenaltyXP", "Reason"])
-
-# AI Configuration (Using free Hugging Face API)
-HF_API_URL = "https://api-inference.huggingface.co/models/EleutherAI/gpt-neo-125M"
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN")
-
-# === Helper Functions ===
-def has_attended_today(userid):
-    today = datetime.now().date()
-    records = main_sheet.get_all_records()
-    for row in records:
-        if str(row['UserID']) == str(userid) and row['Action'] == 'Attendance':
-            try:
-                row_date = datetime.strptime(str(row['Timestamp']), "%Y-%m-%d %H:%M:%S").date()
-                if row_date == today:
-                    return True
-            except ValueError:
-                continue
-    return False
-
-def get_user_active_session(userid):
-    sessions = sessions_sheet.get_all_records()
-    for session in sessions:
-        if str(session['UserID']) == str(userid) and session['Status'] == "active":
-            return session
-    return None
-
-def parse_time_input(time_str):
-    """Parse time input like '5 min', '2 hours', '3 PM'"""
-    if not time_str:
-        return datetime.now() + timedelta(minutes=50)
-    
-    time_str = time_str.lower()
-    now = datetime.now()
-    
-    # Match numbers and units
-    match = re.search(r'(\d+)\s*(min|minutes?|hrs?|hours?|days?|d)', time_str)
-    if match:
-        num = int(match.group(1))
-        unit = match.group(2)
-        
-        if unit.startswith('min'):
-            return now + timedelta(minutes=num)
-        elif unit.startswith('hr') or unit.startswith('hour'):
-            return now + timedelta(hours=num)
-        elif unit.startswith('day') or unit == 'd':
-            return now + timedelta(days=num)
-    
-    # Try to parse absolute time (e.g., "2 PM")
+def get_ai_response(prompt, max_chars=180):
+    """Get AI response using Hugging Face free API"""
     try:
-        time_match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', time_str)
-        if time_match:
-            hour = int(time_match.group(1))
-            minute = int(time_match.group(2) or 0)
-            period = time_match.group(3)
-            
-            if period == 'pm' and hour < 12:
-                hour += 12
-            elif period == 'am' and hour == 12:
-                hour = 0
-                
-            return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        payload = {"inputs": prompt}
+        response = requests.post(HF_API_URL, headers=HF_HEADERS, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and len(result) > 0:
+                ai_text = result[0].get('generated_text', '')
+                # Clean and truncate response
+                ai_text = ai_text.replace(prompt, '').strip()
+                return ai_text[:max_chars] + "..." if len(ai_text) > max_chars else ai_text
+        return "Sorry, AI is busy right now. Try again later! 🤖"
     except:
-        pass
-    
-    # Default to 50 minutes
-    return now + timedelta(minutes=50)
-
-# Replace your query_ai function with this improved version
-def query_ai(prompt, max_length=200):
-    if not HF_API_TOKEN:
-        return "⚠️ AI service is currently offline. Please try later."
-    
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_length": max_length,
-            "temperature": 0.7,
-            "do_sample": True,
-            "max_time": 10  # Timeout after 10 seconds
-        }
-    }
-    
-    try:
-        # Try twice with delay
-        for attempt in range(2):
-            response = requests.post(HF_API_URL, headers=headers, json=payload, timeout=15)
-            
-            if response.status_code == 200:
-                return response.json()[0]['generated_text'].strip()
-            
-            # Handle model loading
-            if response.status_code == 503:
-                wait_time = response.json().get('estimated_time', 10)
-                time.sleep(wait_time + 2)  # Wait a bit longer than estimated
-                continue
-                
-        return "⏳ AI is overloaded! Please try again in 30 seconds."
-    
-    except requests.exceptions.Timeout:
-        return "⌛ AI response timed out. Try a simpler question!"
-    except Exception as e:
-        print(f"AI Error: {str(e)}")
-        return "❌ AI glitch! Please try again later."
-
-def apply_penalty(userid, username, xp_deduction, reason):
-    """Apply XP penalty to a user"""
-    # Add to penalties sheet
-    penalties_sheet.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        userid,
-        username,
-        xp_deduction,
-        reason
-    ])
-    
-    # Find user's XP rows and deduct
-    records = main_sheet.get_all_records()
-    for i, row in enumerate(records, start=2):  # start=2 because sheet rows are 1-indexed
-        if str(row['UserID']) == str(userid) and row['XP'].isdigit():
-            current_xp = int(row['XP'])
-            new_xp = max(0, current_xp - xp_deduction)
-            main_sheet.update_cell(i, 5, str(new_xp))  # Column 5 is XP
-            break
-
-# === Attendance Enforcement Decorator ===
-def attendance_required(func):
-    def wrapper(*args, **kwargs):
-        userid = request.args.get('id') or ""
-        if not userid or not has_attended_today(userid):
-            username = request.args.get('user') or ""
-            return f"⚠️ {username}, you must give attendance with !attend first."
-        return func(*args, **kwargs)
-    wrapper.__name__ = func.__name__
-    return wrapper
-
-# === Background Monitoring Thread ===
-def monitor_sessions():
-    while True:
-        try:
-            now = datetime.now()
-            
-            # Check inactive sessions
-            sessions = sessions_sheet.get_all_records()
-            for session in sessions:
-                if session['Status'] == 'active':
-                    last_active = datetime.strptime(session['LastActive'], "%Y-%m-%d %H:%M:%S")
-                    time_diff = now - last_active
-                    
-                    if time_diff > timedelta(minutes=150):  # 2.5 hours
-                        # Apply penalty
-                        username = session['Username']
-                        userid = session['UserID']
-                        penalty = random.randint(30, 50)  # Random penalty between 30-50 XP
-                        apply_penalty(userid, username, penalty, "Inactivity penalty")
-                        
-                        # Remove session
-                        row_idx = sessions_sheet.find(session['UserID']).row
-                        sessions_sheet.delete_rows(row_idx)
-                        
-                        # In real implementation, send penalty message to chat
-                        print(f"⛔ {username} penalized {penalty} XP for inactivity!")
-                    
-                    elif time_diff > timedelta(minutes=120):  # 2 hours
-                        # Update warning count
-                        warnings = int(session.get('Warnings', 0)) + 1
-                        row_idx = sessions_sheet.find(session['UserID']).row
-                        sessions_sheet.update_cell(row_idx, 6, str(warnings))
-                        
-                        # Send warning message
-                        print(f"⚠️ Inactivity warning #{warnings} for {session['Username']}")
-            
-            # Check reminders
-            reminders = reminders_sheet.get_all_records()
-            for reminder in reminders:
-                if reminder['Triggered'] == "FALSE":
-                    reminder_time = datetime.strptime(reminder['ReminderTime'], "%Y-%m-%d %H:%M:%S")
-                    if now >= reminder_time:
-                        # Mark as triggered
-                        row_idx = reminders_sheet.find(reminder['UserID']).row
-                        reminders_sheet.update_cell(row_idx, 5, "TRUE")
-                        
-                        # Send reminder to chat
-                        print(f"🔔 Reminder for {reminder['Username']}: {reminder['Message']}")
-            
-            time.sleep(60)  # Check every minute
-        except Exception as e:
-            print(f"Monitoring error: {str(e)}")
-            time.sleep(60)
-
-# Start monitoring thread
-Thread(target=monitor_sessions, daemon=True).start()
+        return "AI service unavailable. Please try again! 🤖"
 
 # === Rank System ===
 def get_rank(xp):
     xp = int(xp)
-    if xp >= 500:
-        return "📘 Scholar"
-    elif xp >= 300:
-        return "📗 Master"
-    elif xp >= 150:
-        return "📙 Intermediate"
-    elif xp >= 50:
-        return "📕 Beginner"
-    else:
-        return "🍼 Newbie"
+    if xp >= 1000: return "👑 Legend"
+    elif xp >= 500: return "📘 Scholar"
+    elif xp >= 300: return "📗 Master"
+    elif xp >= 150: return "📙 Intermediate"
+    elif xp >= 50: return "📕 Beginner"
+    else: return "🍼 Newbie"
 
 # === Badge System ===
 def get_badges(total_minutes):
     badges = []
-    if total_minutes >= 50:
-        badges.append("🥉 Bronze Mind")
-    if total_minutes >= 110:
-        badges.append("🥈 Silver Brain")
-    if total_minutes >= 150:
-        badges.append("🥇 Golden Genius")
-    if total_minutes >= 240:
-        badges.append("🔷 Diamond Crown")
+    if total_minutes >= 50: badges.append("🥉 Bronze Mind")
+    if total_minutes >= 110: badges.append("🥈 Silver Brain")
+    if total_minutes >= 150: badges.append("🥇 Golden Genius")
+    if total_minutes >= 240: badges.append("🔷 Diamond Crown")
+    if total_minutes >= 500: badges.append("💎 Master Scholar")
     return badges
 
-# === Daily Streak ===
-def calculate_streak(userid):
-    records = main_sheet.get_all_records()
-    dates = set()
-    for row in records:
-        if str(row['UserID']) == str(userid) and row['Action'] == 'Attendance':
-            try:
-                date = datetime.strptime(str(row['Timestamp']),
-                                         "%Y-%m-%d %H:%M:%S").date()
-                dates.add(date)
-            except ValueError:
-                pass
+# === User Management ===
+def get_or_create_user(userid, username):
+    """Get user data or create new user"""
+    try:
+        users = users_sheet.get_all_records()
+        for i, user in enumerate(users):
+            if str(user['UserID']) == str(userid):
+                return i + 2, user  # Return row index and user data
+        
+        # Create new user
+        new_row = [username, userid, 0, 0, 0, "🍼 Newbie", 
+                  datetime.now().strftime("%Y-%m-%d"), 
+                  datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
+                  "Inactive", 0]
+        users_sheet.append_row(new_row)
+        return len(users) + 2, {
+            'Username': username, 'UserID': userid, 'TotalXP': 0,
+            'CurrentStreak': 0, 'TotalStudyMinutes': 0, 'Rank': "🍼 Newbie"
+        }
+    except:
+        return None, None
 
-    if not dates:
+def update_user_xp(userid, xp_to_add):
+    """Update user's total XP and rank"""
+    row_idx, user = get_or_create_user(userid, "")
+    if row_idx:
+        new_xp = int(user.get('TotalXP', 0)) + xp_to_add
+        new_rank = get_rank(new_xp)
+        users_sheet.update_cell(row_idx, 3, new_xp)  # TotalXP
+        users_sheet.update_cell(row_idx, 6, new_rank)  # Rank
+
+def calculate_streak(userid):
+    """Calculate daily attendance streak"""
+    try:
+        activities = activities_sheet.get_all_records()
+        dates = set()
+        for activity in activities:
+            if str(activity['UserID']) == str(userid) and activity['Action'] == 'Attendance':
+                try:
+                    date = datetime.strptime(activity['Timestamp'], "%Y-%m-%d %H:%M:%S").date()
+                    dates.add(date)
+                except ValueError:
+                    pass
+        
+        if not dates:
+            return 0
+        
+        streak = 0
+        today = datetime.now().date()
+        
+        for i in range(0, 365):
+            day = today - timedelta(days=i)
+            if day in dates:
+                streak += 1
+            else:
+                break
+        return streak
+    except:
         return 0
 
-    streak = 0
-    today = datetime.now().date()
+# === Session Management ===
+def check_session_activity():
+    """Background task to check for inactive sessions"""
+    try:
+        sessions = sessions_sheet.get_all_records()
+        now = datetime.now()
+        
+        for i, session in enumerate(sessions):
+            if session['Status'] == 'Active':
+                last_activity = datetime.strptime(session['LastActivity'], "%Y-%m-%d %H:%M:%S")
+                time_diff = (now - last_activity).total_seconds() / 3600  # hours
+                
+                if time_diff >= 2:  # 2 hours inactive
+                    # Send first warning
+                    sessions_sheet.update_cell(i + 2, 5, 'Warning1')
+                    send_warning_message(session['Username'], session['UserID'], 1)
+                    
+            elif session['Status'] == 'Warning1':
+                last_activity = datetime.strptime(session['LastActivity'], "%Y-%m-%d %H:%M:%S")
+                time_diff = (now - last_activity).total_seconds() / 60  # minutes
+                
+                if time_diff >= 30:  # 30 minutes after warning
+                    # Apply penalty
+                    apply_inactivity_penalty(session['UserID'], session['Username'])
+                    sessions_sheet.delete_rows(i + 2)
+    except Exception as e:
+        print(f"Error checking sessions: {e}")
 
-    for i in range(0, 365):
-        day = today - timedelta(days=i)
-        if day in dates:
-            streak += 1
-        else:
-            break
-    return streak
+def send_warning_message(username, userid, warning_num):
+    """Send warning message to user"""
+    # This would integrate with your chat system
+    print(f"⚠️ {username}, you've been inactive for 2 hours! Type !working to continue or your session will be penalized in 30 minutes.")
+
+def apply_inactivity_penalty(userid, username):
+    """Apply penalty for inactivity"""
+    penalty_xp = -50  # Penalty amount
+    update_user_xp(userid, penalty_xp)
+    
+    # Log penalty
+    activities_sheet.append_row([
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        userid, username, "Inactivity Penalty", penalty_xp, 
+        "", "Auto-penalty for inactivity", datetime.now().strftime("%Y-%m")
+    ])
+
+# Schedule session checking every 30 minutes
+scheduler.add_job(check_session_activity, 'interval', minutes=30)
+
+# === Reminder System ===
+def parse_time_from_text(text):
+    """Parse time from reminder text"""
+    patterns = [
+        (r'(\d+)\s*min', lambda m: datetime.now() + timedelta(minutes=int(m.group(1)))),
+        (r'(\d+)\s*hour', lambda m: datetime.now() + timedelta(hours=int(m.group(1)))),
+        (r'(\d+)\s*PM', lambda m: datetime.now().replace(hour=int(m.group(1)) + 12, minute=0, second=0)),
+        (r'(\d+)\s*AM', lambda m: datetime.now().replace(hour=int(m.group(1)), minute=0, second=0)),
+    ]
+    
+    for pattern, time_func in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return time_func(match)
+    
+    # Default: 50 minutes later
+    return datetime.now() + timedelta(minutes=50)
+
+def send_reminder(reminder_id):
+    """Send scheduled reminder"""
+    try:
+        reminders = reminders_sheet.get_all_records()
+        for i, reminder in enumerate(reminders):
+            if reminder['ReminderID'] == reminder_id and reminder['Status'] == 'Pending':
+                # Mark as sent
+                reminders_sheet.update_cell(i + 2, 6, 'Sent')
+                # Send notification (integrate with your chat system)
+                print(f"🔔 {reminder['Username']}, reminder: {reminder['ReminderText']}")
+                break
+    except Exception as e:
+        print(f"Error sending reminder: {e}")
+
+# === AI Plan Generator ===
+def generate_study_plan(request_text):
+    """Generate study plan using AI"""
+    prompt = f"Create a short study plan for: {request_text}. Make it concise and actionable."
+    return get_ai_response(prompt, 180)
 
 # === ROUTES ===
 
-# ✅ !attend
 @app.route("/attend")
 def attend():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
     now = datetime.now()
     today_date = now.date()
 
-    # Check if this user already gave attendance today
-    records = main_sheet.get_all_records()
-    for row in records[::-1]:
-        if str(row['UserID']) == str(userid) and row['Action'] == 'Attendance':
-            try:
-                row_date = datetime.strptime(str(row['Timestamp']),
-                                             "%Y-%m-%d %H:%M:%S").date()
-                if row_date == today_date:
-                    return f"⚠️ {username}, your attendance for today is already recorded! ✅"
-            except ValueError:
-                continue
+    # Check if already attended today
+    activities = activities_sheet.get_all_records()
+    for activity in activities[::-1]:
+        if (str(activity['UserID']) == str(userid) and 
+            activity['Action'] == 'Attendance' and
+            activity['Timestamp'].startswith(str(today_date))):
+            return f"⚠️ {username}, attendance already recorded today! ✅"
 
-    # Log new attendance
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
-    main_sheet.append_row(
-        [username, userid, timestamp, "Attendance", "10", "", "", ""])
+    # Log attendance
+    activities_sheet.append_row([
+        now.strftime("%Y-%m-%d %H:%M:%S"), userid, username,
+        "Attendance", 10, "", "Daily attendance", now.strftime("%Y-%m")
+    ])
+    
+    # Update user XP
+    update_user_xp(userid, 10)
+    
+    # Calculate streak
     streak = calculate_streak(userid)
+    
+    return f"✅ {username}, attendance logged! +10 XP 🔥 Streak: {streak} days"
 
-    return f"✅ {username}, your attendance is logged and you earned 10 XP! 🔥 Daily Streak: {streak} days."
-
-# ✅ !start
 @app.route("/start")
-@attendance_required
 def start():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # Check if a session is already running
-    if get_user_active_session(userid):
-        return f"⚠️ {username}, you already started a session. Use `!stop` before starting a new one."
-
-    # Log a new session start
-    sessions_sheet.append_row([userid, username, now, now, "active", "0"])
-    return f"⏱️ {username}, your study session has started! Use `!stop` to end it. Happy studying 📚"
-
-# ✅ !stop
-@app.route("/stop")
-@attendance_required
-def stop():
-    username = request.args.get('user')
-    userid = request.args.get('id')
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
     now = datetime.now()
 
-    # Get active session
-    session = get_user_active_session(userid)
-    if not session:
-        return f"⚠️ {username}, you didn't start any session. Use `!start` to begin."
+    # Check if session already active
+    sessions = sessions_sheet.get_all_records()
+    for session in sessions:
+        if str(session['UserID']) == str(userid):
+            return f"⚠️ {username}, session already active! Use !stop first."
 
-    # Calculate duration
-    session_start = datetime.strptime(session['StartTime'], "%Y-%m-%d %H:%M:%S")
-    duration_minutes = int((now - session_start).total_seconds() / 60)
-    xp_earned = duration_minutes * 2
-
-    # Add final study session row
-    main_sheet.append_row([
-        username, userid,
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-        "Study Session", str(xp_earned),
-        session_start.strftime("%Y-%m-%d %H:%M:%S"),
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-        f"{duration_minutes} min"
+    # Create new session
+    sessions_sheet.append_row([
+        userid, username, now.strftime("%Y-%m-%d %H:%M:%S"),
+        now.strftime("%Y-%m-%d %H:%M:%S"), "Active", "", 0
     ])
-
-    # Remove from active sessions
-    row_idx = sessions_sheet.find(userid).row
-    sessions_sheet.delete_rows(row_idx)
-
-    # Check badge
-    badges = get_badges(duration_minutes)
-    badge_message = f" 🎖 {username}, you unlocked a badge: {badges[-1]}! Keep it up" if badges else ""
-
-    return f"👩🏻‍💻📓✍🏻 {username}, you studied for {duration_minutes} minutes and earned {xp_earned} XP.{badge_message}"
-
-# ✅ !rank
-@app.route("/rank")
-@attendance_required
-def rank():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-
-    records = main_sheet.get_all_records()
-    total_xp = 0
-
-    for row in records:
-        if str(row['UserID']) == str(userid):
-            try:
-                total_xp += int(row['XP'])
-            except ValueError:
-                pass
-
-    user_rank = get_rank(total_xp)
-    return f"🏅 {username}, you have {total_xp} XP. Your rank is: {user_rank}"
-
-# ✅ !top
-@app.route("/top")
-def leaderboard():
-    records = main_sheet.get_all_records()
-    xp_map = {}
-
-    for row in records:
-        name = row['Username']
-        try:
-            xp = int(row['XP'])
-        except ValueError:
-            continue
-
-        if name in xp_map:
-            xp_map[name] += xp
-        else:
-            xp_map[name] = xp
-
-    sorted_users = sorted(xp_map.items(), key=lambda x: x[1], reverse=True)[:5]
-    message = "🏆 Top 5 Learners:\n"
-    for i, (user, xp) in enumerate(sorted_users, 1):
-        message += f"{i}. {user} - {xp} XP\n"
-
-    return message.strip()
-
-# ✅ !task
-@app.route("/task")
-@attendance_required
-def add_task():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    msg = request.args.get('msg')
-
-    if not msg or len(msg.strip().split()) < 2:
-        return f"⚠️ {username}, please provide a task like: !task Physics Chapter 1 or !task Studying Math."
-
-    records = main_sheet.get_all_records()
-    for row in records[::-1]:
-        if str(row['UserID']) == str(userid) and str(
-                row['Action']).startswith("Task:") and "✅ Done" not in str(
-                    row['Action']):
-            return f"⚠️ {username}, please complete your previous task first. Use `!done` to mark it as completed."
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    task_name = msg.strip()
-    main_sheet.append_row([
-        username or "", userid or "", now, f"Task: {task_name}", "0", "", "", ""
-    ])
-    return f"✏️ {username}, your task '{task_name}' has been added. Study well! Use `!done` to mark it as completed. Use `!remove` to remove it."
-
-# ✅ !done
-@app.route("/done")
-@attendance_required
-def mark_done():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-
-    records = main_sheet.get_all_records()
-
-    # Calculate total minutes BEFORE this task
-    previous_total_minutes = 0
-    for row in records:
-        if str(row['UserID']) == str(
-                userid) and row['Action'] == "Study Session":
-            try:
-                minutes = int(str(row['Duration']).replace("min", "").strip())
-                previous_total_minutes += minutes
-            except (ValueError, KeyError):
-                pass
-
-    for i in range(len(records) - 1, -1, -1):
-        row = records[i]
-        if str(row['UserID']) == str(userid) and str(
-                row['Action']).startswith("Task:") and "✅ Done" not in str(
-                    row['Action']):
-            row_index = i + 2
-            task_name = str(row['Action'])[6:]
-
-            # Mark task as done
-            main_sheet.update_cell(row_index, 4, f"Task: {task_name} ✅ Done")
-
-            # Add XP row for completing task
-            xp_earned = 15
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            main_sheet.append_row([
-                str(username),
-                str(userid), now, "Task Completed",
-                str(xp_earned), "", "", ""
-            ])
-
-            # Recalculate total minutes AFTER this task (no change since task isn't time-based)
-            new_total_minutes = previous_total_minutes
-            old_badges = get_badges(previous_total_minutes)
-            new_badges = get_badges(new_total_minutes)
-
-            badge_message = ""
-            if len(new_badges) > len(old_badges):
-                badge_message = f" 🎖 {username}, you unlocked a badge: {new_badges[-1]}! keep it up"
-
-            return f"✅ {username}, you completed your task '{task_name}' and earned {xp_earned} XP! Great job! 💪{badge_message}"
-
-    return f"⚠️ {username}, you don't have any active task. Use `!task Your Task` to add one."
-
-# ✅ !remove
-@app.route("/remove")
-@attendance_required
-def remove_task():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-
-    records = main_sheet.get_all_records()
-    for i in range(len(records) - 1, -1, -1):
-        row = records[i]
-        if str(row['UserID']) == str(userid) and str(
-                row['Action']).startswith("Task:") and "✅ Done" not in str(
-                    row['Action']):
-            row_index = i + 2
-            task_name = str(row['Action'])[6:]
-            main_sheet.delete_rows(row_index)
-            return f"🗑️ {username}, your task '{task_name}' has been removed. Use `!task Your Task` to add a new one."
-
-    return f"⚠️ {username}, you have no active task to remove. Use `!task Your Task` to add one."
-
-# ✅ !weeklytop
-@app.route("/weeklytop")
-def weekly_top():
-    records = main_sheet.get_all_records()
-    xp_map = {}
-    one_week_ago = datetime.now() - timedelta(days=7)
-
-    for row in records:
-        try:
-            xp = int(row['XP'])
-            timestamp = datetime.strptime(str(row['Timestamp']),
-                                          "%Y-%m-%d %H:%M:%S")
-            if timestamp >= one_week_ago:
-                user = row['Username']
-                xp_map[user] = xp_map.get(user, 0) + xp
-        except (ValueError, KeyError):
-            continue
-
-    sorted_users = sorted(xp_map.items(), key=lambda x: x[1], reverse=True)[:5]
-    message = "📆 Weekly Top 5 Learners:\n"
-    for i, (user, xp) in enumerate(sorted_users, 1):
-        message += f"{i}. {user} - {xp} XP\n"
-
-    return message.strip()
-
-# ✅ !goal
-@app.route("/goal")
-@attendance_required
-def goal():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    msg = request.args.get('msg') or ""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    records = main_sheet.get_all_records()
-    user_row_index = None
-
-    # Find the last goal row or existing goal row for the user
-    for i in range(len(records) - 1, -1, -1):
-        row = records[i]
-        if str(row['UserID']) == str(userid) and row.get('Goal'):
-            user_row_index = i + 2
-            break
-
-    if msg.strip():
-        # Set or update goal
-        if user_row_index:
-            main_sheet.update_cell(user_row_index, 9,
-                              msg.strip())  # Update Goal column
-        else:
-            main_sheet.append_row([
-                username or "", userid or "", now, "Set Goal", "0", "", "", "",
-                msg.strip()
-            ])
-        return f"🎯 {username}, your goal has been set to: {msg.strip()} Use `!complete` to mark it as achieved. Use `!goal` to view your current goal."
-    else:
-        # Show existing goal
-        for row in records[::-1]:
-            if str(row['UserID']) == str(userid) and row.get('Goal'):
-                return f"🎯 {username}, your current goal is: {row['Goal']} Use `!complete` to mark it as achieved."
-        return f"⚠️ {username}, you haven't set any goal. Use `!goal Your Goal` to set one."
-
-# ✅ !complete
-@app.route("/complete")
-@attendance_required
-def complete_goal():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-
-    records = main_sheet.get_all_records()
-
-    for i in range(len(records) - 1, -1, -1):
-        row = records[i]
-        if str(row['UserID']) == str(userid) and row.get('Goal'):
-            row_index = i + 2
-            main_sheet.update_cell(row_index, 9, "")  # Clear the goal
-            return f"🎉 {username}, you achieved your goal! Congratulations!"
-
-    return f"⚠️ {username}, you don't have any goal set. Use `!goal Your Goal` to set one."
-
-# ✅ !summary
-@app.route("/summary")
-@attendance_required
-def summary():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-
-    records = main_sheet.get_all_records()
-
-    total_minutes = 0
-    total_xp = 0
-    completed_tasks = 0
-    pending_tasks = 0
-
-    for row in records:
-        if str(row['UserID']) == str(userid):
-            # Total XP
-            try:
-                total_xp += int(row['XP'])
-            except ValueError:
-                pass
-
-            # Study time
-            if row['Action'] == "Study Session":
-                duration_str = str(row.get('Duration',
-                                           '0')).replace(" min", "")
-                try:
-                    total_minutes += int(duration_str)
-                except ValueError:
-                    pass
-
-            # Tasks
-            if str(row['Action']).startswith("Task:"):
-                if "✅ Done" in str(row['Action']):
-                    completed_tasks += 1
-                else:
-                    pending_tasks += 1
-
-    hours = total_minutes // 60
-    minutes = total_minutes % 60
-    return (f"📊 {username}'s Summary:\n"
-            f"⏱️ Total Study Time: {hours}h {minutes}m\n"
-            f"⚜️ Total XP: {total_xp}\n"
-            f"✅ Completed Tasks: {completed_tasks}\n"
-            f"🕒 Pending Tasks: {pending_tasks}")
-
-# ✅ !pending
-@app.route("/pending")
-@attendance_required
-def pending_task():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-
-    records = main_sheet.get_all_records()
-
-    for row in reversed(records):
-        if str(row['UserID']) == str(userid) and str(
-                row['Action']).startswith("Task:") and "✅ Done" not in str(
-                    row['Action']):
-            task_name = str(row['Action'])[6:]  # Remove "Task: " prefix
-            return f"🕒 {username}, your current pending task is: '{task_name}' — Keep going. Use `!done` to mark it as completed. Use `!remove` to remove it."
-
-    return f"✅ {username}, you have no pending tasks! Use `!task Your Task` to add one."
-
-# === New Commands ===
-
-# !break
-@app.route("/break")
-@attendance_required
-def take_break():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    duration = request.args.get('msg') or "5 min"
     
-    try:
-        break_time = parse_time_input(duration)
-        reminders_sheet.append_row([
-            userid, username, 
-            break_time.strftime("%Y-%m-%d %H:%M:%S"),
-            "Break time is over! Get back to study!",
-            "FALSE",
-            duration
-        ])
-        return f"☕ {username}, break started! I'll remind you at {break_time.strftime('%H:%M')}."
-    except Exception:
-        return f"⚠️ {username}, invalid time format. Use like: !break 5 min"
+    return f"⏱️ {username}, study session started! Use !stop to end. 📚"
 
-# !remind
+@app.route("/stop")
+def stop():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    now = datetime.now()
+
+    # Find active session
+    sessions = sessions_sheet.get_all_records()
+    for i, session in enumerate(sessions):
+        if str(session['UserID']) == str(userid):
+            start_time = datetime.strptime(session['StartTime'], "%Y-%m-%d %H:%M:%S")
+            duration_minutes = int((now - start_time).total_seconds() / 60)
+            
+            # Calculate XP (minus break time)
+            break_time = int(session.get('TotalBreakTime', 0))
+            study_minutes = max(0, duration_minutes - break_time)
+            xp_earned = study_minutes * 2
+
+            # Log study session
+            activities_sheet.append_row([
+                now.strftime("%Y-%m-%d %H:%M:%S"), userid, username,
+                "StudySession", xp_earned, f"{study_minutes} min",
+                f"Studied for {study_minutes} minutes", now.strftime("%Y-%m")
+            ])
+            
+            # Update user data
+            update_user_xp(userid, xp_earned)
+            
+            # Remove session
+            sessions_sheet.delete_rows(i + 2)
+            
+            # Check for badges
+            badges = get_badges(study_minutes)
+            badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
+            
+            return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
+    
+    return f"⚠️ {username}, no active session found. Use !start first."
+
+@app.route("/working")
+def working():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    now = datetime.now()
+
+    # Update session activity
+    sessions = sessions_sheet.get_all_records()
+    for i, session in enumerate(sessions):
+        if str(session['UserID']) == str(userid):
+            sessions_sheet.update_cell(i + 2, 4, now.strftime("%Y-%m-%d %H:%M:%S"))  # LastActivity
+            sessions_sheet.update_cell(i + 2, 5, "Active")  # Status
+            return f"✅ {username}, session activity confirmed! Keep studying! 💪"
+    
+    return f"⚠️ {username}, no active session found."
+
+@app.route("/break")
+def take_break():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '20')  # Default 20 minutes
+    
+    # Parse break duration
+    duration_match = re.search(r'(\d+)', msg)
+    duration = int(duration_match.group(1)) if duration_match else 20
+    duration = min(duration, 120)  # Max 2 hours
+    
+    now = datetime.now()
+    break_end = now + timedelta(minutes=duration)
+    
+    # Update session with break
+    sessions = sessions_sheet.get_all_records()
+    for i, session in enumerate(sessions):
+        if str(session['UserID']) == str(userid):
+            current_break = int(session.get('TotalBreakTime', 0))
+            sessions_sheet.update_cell(i + 2, 5, "Break")  # Status
+            sessions_sheet.update_cell(i + 2, 6, break_end.strftime("%Y-%m-%d %H:%M:%S"))  # BreakEndTime
+            sessions_sheet.update_cell(i + 2, 7, current_break + duration)  # TotalBreakTime
+            
+            # Schedule break end reminder
+            reminder_id = str(uuid.uuid4())
+            reminders_sheet.append_row([
+                reminder_id, userid, username, f"Break time over! Back to studying 📚",
+                break_end.strftime("%Y-%m-%d %H:%M:%S"), "Pending", "Break"
+            ])
+            scheduler.add_job(send_reminder, 'date', run_date=break_end, args=[reminder_id])
+            
+            return f"☕ {username}, enjoy your {duration}min break! I'll remind you when it's over."
+    
+    return f"⚠️ {username}, start a session first to take a break."
+
 @app.route("/remind")
-@attendance_required
 def set_reminder():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    msg = request.args.get('msg') or ""
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '')
     
     if not msg:
-        return f"⚠️ {username}, please specify reminder time and message. Example: !remind 30 min finish math assignment"
+        return f"⚠️ {username}, specify what to remind! E.g., !remind meeting in 30 min"
     
-    try:
-        # Extract time and message
-        parts = msg.split(maxsplit=1)
-        if len(parts) < 2:
-            return f"⚠️ {username}, include both time and message. Example: !remind 30 min finish math"
-            
-        time_part, reminder_msg = parts
-        reminder_time = parse_time_input(time_part)
-        
-        reminders_sheet.append_row([
-            userid, username, 
-            reminder_time.strftime("%Y-%m-%d %H:%M:%S"),
-            reminder_msg,
-            "FALSE",
-            time_part
-        ])
-        return f"⏰ {username}, reminder set for {reminder_time.strftime('%H:%M')}: {reminder_msg}"
-    except Exception:
-        return f"⚠️ {username}, invalid reminder format. Use: !remind [time] [message]"
+    # Parse reminder time
+    reminder_time = parse_time_from_text(msg)
+    reminder_text = re.sub(r'\d+\s*(min|hour|PM|AM)', '', msg, flags=re.IGNORECASE).strip()
+    
+    if not reminder_text:
+        reminder_text = "Your reminder!"
+    
+    # Create reminder
+    reminder_id = str(uuid.uuid4())
+    reminders_sheet.append_row([
+        reminder_id, userid, username, reminder_text,
+        reminder_time.strftime("%Y-%m-%d %H:%M:%S"), "Pending", "Remind"
+    ])
+    
+    # Schedule reminder
+    scheduler.add_job(send_reminder, 'date', run_date=reminder_time, args=[reminder_id])
+    
+    time_diff = reminder_time - datetime.now()
+    if time_diff.total_seconds() < 3600:  # Less than 1 hour
+        time_str = f"{int(time_diff.total_seconds() / 60)} minutes"
+    else:
+        time_str = f"{int(time_diff.total_seconds() / 3600)} hours"
+    
+    return f"⏰ {username}, reminder set for '{reminder_text}' in {time_str}!"
 
-# !comtask
+@app.route("/task")
+def add_task():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '')
+
+    if not msg or len(msg.strip()) < 3:
+        return f"⚠️ {username}, specify your task! E.g., !task Physics Chapter 5"
+
+    # Check for active tasks
+    tasks = tasks_sheet.get_all_records()
+    active_tasks = [t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Active']
+    
+    if active_tasks:
+        return f"⚠️ {username}, complete your current task first! Use !done"
+
+    # Create new task
+    task_id = str(uuid.uuid4())[:8]
+    tasks_sheet.append_row([
+        task_id, userid, username, msg.strip(), "Active",
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "", 0
+    ])
+    
+    return f"✏️ {username}, task '{msg.strip()}' added! Use !done when complete."
+
+@app.route("/done")
+def mark_done():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
+    # Find active task
+    tasks = tasks_sheet.get_all_records()
+    for i, task in enumerate(tasks):
+        if str(task['UserID']) == str(userid) and task['Status'] == 'Active':
+            # Mark as completed
+            tasks_sheet.update_cell(i + 2, 5, 'Completed')  # Status
+            tasks_sheet.update_cell(i + 2, 7, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))  # CompletedDate
+            tasks_sheet.update_cell(i + 2, 8, 15)  # XPEarned
+            
+            # Log completion
+            activities_sheet.append_row([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), userid, username,
+                "TaskCompleted", 15, "", f"Completed: {task['TaskName']}", 
+                datetime.now().strftime("%Y-%m")
+            ])
+            
+            # Update user XP
+            update_user_xp(userid, 15)
+            
+            return f"✅ {username}, task '{task['TaskName']}' completed! +15 XP 💪"
+    
+    return f"⚠️ {username}, no active task found. Use !task to add one."
+
+@app.route("/remove")
+def remove_task():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
+    # Find active task
+    tasks = tasks_sheet.get_all_records()
+    for i, task in enumerate(tasks):
+        if str(task['UserID']) == str(userid) and task['Status'] == 'Active':
+            # Mark as removed
+            tasks_sheet.update_cell(i + 2, 5, 'Removed')
+            return f"🗑️ {username}, task '{task['TaskName']}' removed!"
+    
+    return f"⚠️ {username}, no active task found."
+
 @app.route("/comtask")
-@attendance_required
 def completed_tasks():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    
-    records = main_sheet.get_all_records()
-    completed = []
-    
-    for row in records:
-        if (str(row['UserID']) == str(userid) and 
-            str(row['Action']).startswith("Task:") and 
-            "✅ Done" in str(row['Action'])):
-            task_name = str(row['Action']).split("Task: ")[1].replace("✅ Done", "").strip()
-            completed.append(task_name)
-    
-    if not completed:
-        return f"📭 {username}, you haven't completed any tasks yet."
-    
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
     # Get last 3 completed tasks
-    last_three = completed[-3:]
-    response = f"✅ {username}'s recently completed tasks:\n"
-    for i, task in enumerate(reversed(last_three), 1):
-        response += f"{i}. {task}\n"
+    tasks = tasks_sheet.get_all_records()
+    completed = [t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Completed']
+    recent_tasks = sorted(completed, key=lambda x: x['CompletedDate'], reverse=True)[:3]
+    
+    if not recent_tasks:
+        return f"📝 {username}, no completed tasks yet. Keep going!"
+    
+    response = f"🏆 {username}'s recent completions:\n"
+    for i, task in enumerate(recent_tasks, 1):
+        date = task['CompletedDate'][:10]  # Just date part
+        response += f"{i}. {task['TaskName']} ({date})\n"
     
     return response.strip()
 
-# !monthtop
+@app.route("/pending")
+def pending_task():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
+    # Find active task
+    tasks = tasks_sheet.get_all_records()
+    for task in tasks:
+        if str(task['UserID']) == str(userid) and task['Status'] == 'Active':
+            return f"🕒 {username}, your current task: '{task['TaskName']}' - Use !done to complete"
+    
+    return f"✅ {username}, no pending tasks! Use !task to add one."
+
+@app.route("/rank")
+def rank():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
+    row_idx, user = get_or_create_user(userid, username)
+    if user:
+        return f"🏅 {username}: {user['TotalXP']} XP | Rank: {user['Rank']}"
+    return f"⚠️ Error fetching rank data."
+
+@app.route("/top")
+def leaderboard():
+    try:
+        users = users_sheet.get_all_records()
+        sorted_users = sorted(users, key=lambda x: int(x.get('TotalXP', 0)), reverse=True)[:5]
+        
+        response = "🏆 Top 5 Learners:\n"
+        for i, user in enumerate(sorted_users, 1):
+            response += f"{i}. {user['Username']} - {user['TotalXP']} XP\n"
+        
+        return response.strip()
+    except:
+        return "Error loading leaderboard."
+
+@app.route("/weeklytop")
+def weekly_top():
+    try:
+        one_week_ago = datetime.now() - timedelta(days=7)
+        activities = activities_sheet.get_all_records()
+        
+        weekly_xp = {}
+        for activity in activities:
+            try:
+                timestamp = datetime.strptime(activity['Timestamp'], "%Y-%m-%d %H:%M:%S")
+                if timestamp >= one_week_ago:
+                    user = activity['Username']
+                    xp = int(activity.get('XPEarned', 0))
+                    weekly_xp[user] = weekly_xp.get(user, 0) + xp
+            except:
+                continue
+        
+        sorted_users = sorted(weekly_xp.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        response = "📆 Weekly Top 5:\n"
+        for i, (user, xp) in enumerate(sorted_users, 1):
+            response += f"{i}. {user} - {xp} XP\n"
+        
+        return response.strip()
+    except:
+        return "Error loading weekly leaderboard."
+
 @app.route("/monthtop")
-def monthly_leaderboard():
-    records = main_sheet.get_all_records()
-    xp_map = {}
-    now = datetime.now()
-    
-    for row in records:
-        try:
-            timestamp = datetime.strptime(str(row['Timestamp']), "%Y-%m-%d %H:%M:%S")
-            if timestamp.month == now.month and timestamp.year == now.year:
-                user = row['Username']
-                xp = int(row['XP'])
-                xp_map[user] = xp_map.get(user, 0) + xp
-        except (ValueError, KeyError):
-            continue
-    
-    sorted_users = sorted(xp_map.items(), key=lambda x: x[1], reverse=True)[:5]
-    message = "📅 Monthly Top 5 Learners:\n"
-    for i, (user, xp) in enumerate(sorted_users, 1):
-        message += f"{i}. {user} - {xp} XP\n"
-    
-    return message.strip()
+def monthly_top():
+    try:
+        current_month = datetime.now().strftime("%Y-%m")
+        activities = activities_sheet.get_all_records()
+        
+        monthly_xp = {}
+        for activity in activities:
+            if activity.get('Month') == current_month:
+                user = activity['Username']
+                xp = int(activity.get('XPEarned', 0))
+                monthly_xp[user] = monthly_xp.get(user, 0) + xp
+        
+        sorted_users = sorted(monthly_xp.items(), key=lambda x: x[1], reverse=True)[:5]
+        
+        response = "📅 Monthly Top 5:\n"
+        for i, (user, xp) in enumerate(sorted_users, 1):
+            response += f"{i}. {user} - {xp} XP\n"
+        
+        return response.strip()
+    except:
+        return "Error loading monthly leaderboard."
 
-# !report
-@app.route("/report")
-@attendance_required
-def report_user():
-    reporter = request.args.get('user')
-    userid = request.args.get('id')
-    msg = request.args.get('msg') or ""
-    
-    if not msg or len(msg.split()) < 2:
-        return f"⚠️ {reporter}, please specify user and reason. Example: !report username Spamming chat"
-    
-    reported_user, *reason_parts = msg.split(maxsplit=1)
-    reason = reason_parts[0] if reason_parts else "No reason provided"
-    
-    reports_sheet.append_row([
-        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        reporter,
-        reported_user,
-        reason,
-        "FALSE"
-    ])
-    
-    return f"📢 {reporter}, your report against {reported_user} has been recorded. Moderators will review it."
+@app.route("/goal")
+def goal():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '')
 
-# !plan
+    if msg.strip():
+        # Set new goal
+        goals_sheet.append_row([
+            userid, username, msg.strip(), 
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Active"
+        ])
+        return f"🎯 {username}, goal set: '{msg.strip()}' - Use !complete to mark achieved!"
+    else:
+        # Show current goal
+        goals = goals_sheet.get_all_records()
+        for goal in goals[::-1]:
+            if str(goal['UserID']) == str(userid) and goal['Status'] == 'Active':
+                return f"🎯 {username}, current goal: '{goal['Goal']}' - Use !complete to mark achieved!"
+        return f"⚠️ {username}, no active goal. Use !goal Your Goal to set one."
+
+@app.route("/complete")
+def complete_goal():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
+    # Find active goal
+    goals = goals_sheet.get_all_records()
+    for i, goal in enumerate(goals):
+        if str(goal['UserID']) == str(userid) and goal['Status'] == 'Active':
+            # Mark as completed
+            goals_sheet.update_cell(i + 2, 5, 'Completed')
+            
+            # Add XP reward
+            activities_sheet.append_row([
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"), userid, username,
+                "GoalCompleted", 25, "", f"Completed goal: {goal['Goal']}", 
+                datetime.now().strftime("%Y-%m")
+            ])
+            
+            update_user_xp(userid, 25)
+            
+            return f"🎉 {username}, goal achieved! +25 XP! 🎊"
+    
+    return f"⚠️ {username}, no active goal found."
+
+@app.route("/summary")
+def summary():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+
+    try:
+        # Get user data
+        row_idx, user = get_or_create_user(userid, username)
+        if not user:
+            return f"⚠️ Error loading summary"
+        
+        # Get tasks data
+        tasks = tasks_sheet.get_all_records()
+        completed_tasks = len([t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Completed'])
+        pending_tasks = len([t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Active'])
+        
+        # Calculate time
+        total_minutes = int(user.get('TotalStudyMinutes', 0))
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        
+        return (f"📊 {username}'s Summary:\n"
+                f"⏱️ Total Study Time: {hours}h {minutes}m\n"
+                f"⚜️ Total XP: {user['TotalXP']}\n"
+                f"🔥 Streak: {user['CurrentStreak']} days\n"
+                f"✅ Completed Tasks: {completed_tasks}\n"
+                f"🕒 Pending Tasks: {pending_tasks}\n"
+                f"🏅 Rank: {user['Rank']}")
+    except:
+        return f"⚠️ Error loading summary"
+
 @app.route("/plan")
-@attendance_required
 def study_plan():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    msg = request.args.get('msg') or ""
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '')
     
     if not msg:
-        return f"⚠️ {username}, please describe your planning needs. Example: !plan exam in 3 days covering physics and math"
+        return f"⚠️ {username}, describe your study needs! E.g., !plan exam in 3 days, math physics"
     
-    prompt = f"Create a concise study plan for: {msg}. Max 200 characters."
-    plan = query_ai(prompt)
-    return f"📚 {username}, here's your study plan:\n{plan}"
+    # Generate AI plan
+    ai_plan = generate_study_plan(msg)
+    
+    # Save plan
+    plan_id = str(uuid.uuid4())[:8]
+    plans_sheet.append_row([
+        plan_id, userid, username, msg.strip(), ai_plan,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ])
+    
+    return f"📚 {username}, here's your study plan:\n{ai_plan}\n\n💡 Plan saved! Use !myplans to view saved plans."
 
-# !progress
-@app.route("/progress")
-@attendance_required
-def progress_report():
-    username = request.args.get('user')
-    userid = request.args.get('id')
-    period = request.args.get('msg') or "overall"
+@app.route("/myplans")
+def my_plans():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
     
-    # Get user's study data
-    records = main_sheet.get_all_records()
-    study_data = []
-    
-    for row in records:
-        if str(row['UserID']) == str(userid) and row['Action'] == "Study Session":
-            try:
-                duration = int(str(row['Duration']).replace("min", "").strip())
-                study_data.append({
-                    "date": row['Timestamp'],
-                    "duration": duration
-                })
-            except:
-                pass
-    
-    # Create prompt for AI
-    prompt = f"Generate a progress report and suggestions for {username} based on their {period} study data: {study_data}. Max 200 characters."
-    report = query_ai(prompt)
-    return f"📊 {username}, your progress report:\n{report}"
+    try:
+        plans = plans_sheet.get_all_records()
+        user_plans = [p for p in plans if str(p['UserID']) == str(userid)]
+        recent_plans = sorted(user_plans, key=lambda x: x['CreatedDate'], reverse=True)[:3]
+        
+        if not recent_plans:
+            return f"📚 {username}, no study plans yet. Use !plan to create one!"
+        
+        response = f"📋 {username}'s Recent Plans:\n"
+        for i, plan in enumerate(recent_plans, 1):
+            date = plan['CreatedDate'][:10]  # Just date part
+            response += f"\n{i}. Request: {plan['PlanRequest']}\n"
+            response += f"   Date: {date}\n"
+            response += f"   Plan: {plan['PlanResponse'][:100]}...\n"
+        
+        return response.strip()
+    except:
+        return f"⚠️ {username}, error loading plans."
 
-# !ai
+@app.route("/report")
+def report_user():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '')
+    
+    if not msg or len(msg.split()) < 2:
+        return f"⚠️ {username}, use: !report username reason"
+    
+    parts = msg.split(' ', 1)
+    reported_user = parts[0]
+    reason = parts[1] if len(parts) > 1 else "No reason specified"
+    
+    # Create report
+    report_id = str(uuid.uuid4())[:8]
+    reports_sheet.append_row([
+        report_id, userid, username, reported_user, reason,
+        datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "Pending"
+    ])
+    
+    return f"📝 {username}, report submitted against {reported_user}. Moderators will review."
+
+@app.route("/help")
+def help_command():
+    username = request.args.get('user', '')
+    
+    help_text = f"""🤖 StudyPlus Commands for {username}:
+
+📚 **Study Sessions:**
+!start - Begin study session
+!stop - End session & get XP
+!working - Confirm you're studying
+!break 20 - Take 20min break
+
+📋 **Tasks:**
+!task Math Chapter 5 - Add task
+!done - Complete current task
+!remove - Remove current task
+!pending - Show current task
+!comtask - Show completed tasks
+
+🎯 **Goals & Progress:**
+!goal Study 5hrs daily - Set goal
+!complete - Mark goal achieved
+!rank - Your XP & rank
+!summary - Full progress summary
+
+🏆 **Leaderboards:**
+!top - Top 5 all-time
+!weeklytop - Weekly leaders
+!monthtop - Monthly leaders
+
+⏰ **Reminders:**
+!remind meeting in 30 min
+!remind study break in 1 hour
+
+📚 **AI Study Plans:**
+!plan exam in 3 days math physics
+!myplans - View saved plans
+
+📅 **Daily:**
+!attend - Mark daily attendance
+
+📝 **Other:**
+!report username reason - Report user
+!help - Show this menu
+
+💡 **XP System:**
+• Daily attendance: +10 XP
+• Study sessions: +2 XP/min
+• Task completion: +15 XP
+• Goal achievement: +25 XP
+
+🏅 **Ranks:**
+🍼 Newbie (0+) → 📕 Beginner (50+) → 📙 Intermediate (150+) → 📗 Master (300+) → 📘 Scholar (500+) → 👑 Legend (1000+)
+
+Keep studying! 💪"""
+    
+    return help_text
+
 @app.route("/ai")
-@attendance_required
-def ai_assistant():
-    username = request.args.get('user')
-    question = request.args.get('msg') or ""
+def ai_chat():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '')
     
-    if not question:
-        return f"⚠️ {username}, ask like: !ai explain quantum physics"
+    if not msg:
+        return f"🤖 {username}, ask me anything! E.g., !ai How to study effectively?"
     
-    if len(question) < 5:
-        return f"📝 {username}, please ask a longer question (min 5 chars)"
+    # Get AI response
+    ai_response = get_ai_response(f"Study helper question: {msg}", 200)
+    
+    return f"🤖 StudyBot: {ai_response}"
+
+@app.route("/streak")
+def streak_info():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    
+    streak = calculate_streak(userid)
+    
+    if streak == 0:
+        return f"🔥 {username}, start your streak! Use !attend daily to build it up."
+    elif streak == 1:
+        return f"🔥 {username}, 1 day streak! Keep going to build momentum! 💪"
+    elif streak < 7:
+        return f"🔥 {username}, {streak} days streak! You're building a habit! 🚀"
+    elif streak < 30:
+        return f"🔥 {username}, {streak} days streak! Amazing consistency! 🌟"
+    else:
+        return f"🔥 {username}, {streak} days streak! You're a legend! 👑"
+
+@app.route("/badges")
+def show_badges():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    
+    # Get user's total study minutes
+    row_idx, user = get_or_create_user(userid, username)
+    if not user:
+        return f"⚠️ Error loading badge data"
+    
+    total_minutes = int(user.get('TotalStudyMinutes', 0))
+    badges = get_badges(total_minutes)
+    
+    if not badges:
+        return f"🎖️ {username}, no badges yet! Study 50+ minutes to earn your first badge!"
+    
+    response = f"🎖️ {username}'s Badges:\n"
+    for badge in badges:
+        response += f"• {badge}\n"
+    
+    # Show next badge target
+    if total_minutes < 50:
+        response += f"\n🎯 Next: Study {50 - total_minutes} more minutes for 🥉 Bronze Mind!"
+    elif total_minutes < 110:
+        response += f"\n🎯 Next: Study {110 - total_minutes} more minutes for 🥈 Silver Brain!"
+    elif total_minutes < 150:
+        response += f"\n🎯 Next: Study {150 - total_minutes} more minutes for 🥇 Golden Genius!"
+    elif total_minutes < 240:
+        response += f"\n🎯 Next: Study {240 - total_minutes} more minutes for 🔷 Diamond Crown!"
+    elif total_minutes < 500:
+        response += f"\n🎯 Next: Study {500 - total_minutes} more minutes for 💎 Master Scholar!"
+    else:
+        response += "\n👑 You've earned all badges! Keep studying!"
+    
+    return response.strip()
+
+@app.route("/stats")
+def detailed_stats():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    
+    try:
+        # Get user data
+        row_idx, user = get_or_create_user(userid, username)
+        if not user:
+            return f"⚠️ Error loading stats"
         
-    response = query_ai(question)
-    
-    # Truncate to chat limits
-    if len(response) > 200:
-        response = response[:197] + "..."
+        # Get this week's activity
+        one_week_ago = datetime.now() - timedelta(days=7)
+        activities = activities_sheet.get_all_records()
         
-    return f"🤖 {username}: {response}"
+        weekly_xp = 0
+        weekly_minutes = 0
+        weekly_tasks = 0
+        
+        for activity in activities:
+            try:
+                if (str(activity['UserID']) == str(userid) and 
+                    datetime.strptime(activity['Timestamp'], "%Y-%m-%d %H:%M:%S") >= one_week_ago):
+                    
+                    weekly_xp += int(activity.get('XPEarned', 0))
+                    
+                    if activity['Action'] == 'StudySession':
+                        duration_str = activity.get('Duration', '0 min')
+                        minutes = int(re.search(r'(\d+)', duration_str).group(1)) if re.search(r'(\d+)', duration_str) else 0
+                        weekly_minutes += minutes
+                    elif activity['Action'] == 'TaskCompleted':
+                        weekly_tasks += 1
+            except:
+                continue
+        
+        # Calculate averages
+        weekly_hours = weekly_minutes // 60
+        weekly_min_remainder = weekly_minutes % 60
+        daily_avg_minutes = weekly_minutes // 7
+        daily_avg_hours = daily_avg_minutes // 60
+        daily_avg_min_remainder = daily_avg_minutes % 60
+        
+        total_minutes = int(user.get('TotalStudyMinutes', 0))
+        total_hours = total_minutes // 60
+        total_min_remainder = total_minutes % 60
+        
+        return (f"📊 {username}'s Detailed Stats:\n\n"
+                f"🏆 **Overall:**\n"
+                f"• Total XP: {user['TotalXP']}\n"
+                f"• Rank: {user['Rank']}\n"
+                f"• Total Study Time: {total_hours}h {total_min_remainder}m\n"
+                f"• Current Streak: {user['CurrentStreak']} days\n\n"
+                f"📅 **This Week:**\n"
+                f"• XP Earned: {weekly_xp}\n"
+                f"• Study Time: {weekly_hours}h {weekly_min_remainder}m\n"
+                f"• Tasks Completed: {weekly_tasks}\n"
+                f"• Daily Average: {daily_avg_hours}h {daily_avg_min_remainder}m\n\n"
+                f"🎯 Keep up the great work! 💪")
+    except:
+        return f"⚠️ Error loading detailed stats"
 
-# !working
-@app.route("/working")
-@attendance_required
-def confirm_working():
-    username = request.args.get('user')
-    userid = request.args.get('id')
+@app.route("/leaderboard")
+def full_leaderboard():
+    username = request.args.get('user', '')
+    type_param = request.args.get('type', 'all')  # all, weekly, monthly
     
-    session = get_user_active_session(userid)
-    if not session:
-        return f"⚠️ {username}, you don't have an active study session."
-    
-    # Update last active time
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    row_idx = sessions_sheet.find(session['UserID']).row
-    sessions_sheet.update_cell(row_idx, 4, now)
-    sessions_sheet.update_cell(row_idx, 5, "active")
-    
-    return f"👩‍💻 {username}, activity confirmed! Keep up the good work!"
+    try:
+        if type_param == 'weekly':
+            one_week_ago = datetime.now() - timedelta(days=7)
+            activities = activities_sheet.get_all_records()
+            
+            weekly_xp = {}
+            for activity in activities:
+                try:
+                    timestamp = datetime.strptime(activity['Timestamp'], "%Y-%m-%d %H:%M:%S")
+                    if timestamp >= one_week_ago:
+                        user = activity['Username']
+                        xp = int(activity.get('XPEarned', 0))
+                        weekly_xp[user] = weekly_xp.get(user, 0) + xp
+                except:
+                    continue
+            
+            sorted_users = sorted(weekly_xp.items(), key=lambda x: x[1], reverse=True)[:10]
+            title = "📆 Weekly Leaderboard (Top 10):"
+            
+        elif type_param == 'monthly':
+            current_month = datetime.now().strftime("%Y-%m")
+            activities = activities_sheet.get_all_records()
+            
+            monthly_xp = {}
+            for activity in activities:
+                if activity.get('Month') == current_month:
+                    user = activity['Username']
+                    xp = int(activity.get('XPEarned', 0))
+                    monthly_xp[user] = monthly_xp.get(user, 0) + xp
+            
+            sorted_users = sorted(monthly_xp.items(), key=lambda x: x[1], reverse=True)[:10]
+            title = "📅 Monthly Leaderboard (Top 10):"
+            
+        else:  # all-time
+            users = users_sheet.get_all_records()
+            sorted_users = [(u['Username'], int(u.get('TotalXP', 0))) for u in users]
+            sorted_users = sorted(sorted_users, key=lambda x: x[1], reverse=True)[:10]
+            title = "🏆 All-Time Leaderboard (Top 10):"
+        
+        if not sorted_users:
+            return f"📊 No data available for {type_param} leaderboard."
+        
+        response = f"{title}\n"
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        
+        for i, (user, xp) in enumerate(sorted_users):
+            medal = medals[i] if i < len(medals) else f"{i+1}."
+            response += f"{medal} {user} - {xp} XP\n"
+        
+        # Show user's position if not in top 10
+        user_found = False
+        for i, (user, xp) in enumerate(sorted_users):
+            if user == username:
+                user_found = True
+                break
+        
+        if not user_found:
+            # Find user's actual position
+            all_users = sorted(weekly_xp.items() if type_param == 'weekly' 
+                             else monthly_xp.items() if type_param == 'monthly' 
+                             else [(u['Username'], int(u.get('TotalXP', 0))) for u in users_sheet.get_all_records()], 
+                             key=lambda x: x[1], reverse=True)
+            
+            for i, (user, xp) in enumerate(all_users):
+                if user == username:
+                    response += f"\n📍 Your position: #{i+1} with {xp} XP"
+                    break
+        
+        return response.strip()
+    except:
+        return "Error loading leaderboard."
 
-# Health checks
-@app.route("/ping")
-def home():
-    return "✅ Sunnie-BOT is alive!"
+@app.route("/motivation")
+def motivation():
+    username = request.args.get('user', '')
+    
+    motivational_quotes = [
+        "🌟 Success is the sum of small efforts repeated day in and day out!",
+        "💪 The expert in anything was once a beginner who refused to give up!",
+        "🚀 Don't watch the clock; do what it does. Keep going!",
+        "⭐ Your limitation—it's only your imagination!",
+        "🔥 Push yourself, because no one else is going to do it for you!",
+        "🏆 Great things never come from comfort zones!",
+        "💎 Dream it. Wish it. Do it!",
+        "🌈 Success doesn't just find you. You have to go out and get it!",
+        "⚡ The harder you work for something, the greater you'll feel when you achieve it!",
+        "🎯 Don't stop when you're tired. Stop when you're done!"
+    ]
+    
+    quote = motivational_quotes[hash(username + str(datetime.now().date())) % len(motivational_quotes)]
+    
+    return f"{quote}\n\nKeep studying, {username}! You've got this! 📚✨"
 
-# === Run Server ===
+@app.route("/focus")
+def focus_mode():
+    username = request.args.get('user', '')
+    userid = request.args.get('id', '')
+    msg = request.args.get('msg', '25')  # Default 25 minutes (Pomodoro)
+    
+    # Parse duration
+    duration_match = re.search(r'(\d+)', msg)
+    duration = int(duration_match.group(1)) if duration_match else 25
+    duration = min(duration, 180)  # Max 3 hours
+    
+    # Set focus session reminder
+    focus_end = datetime.now() + timedelta(minutes=duration)
+    reminder_id = str(uuid.uuid4())
+    
+    reminders_sheet.append_row([
+        reminder_id, userid, username, 
+        f"🎯 Focus session complete! Time for a break! You studied for {duration} minutes.",
+        focus_end.strftime("%Y-%m-%d %H:%M:%S"), "Pending", "Focus"
+    ])
+    
+    # Schedule reminder
+    scheduler.add_job(send_reminder, 'date', run_date=focus_end, args=[reminder_id])
+    
+    return f"🎯 {username}, focus mode activated for {duration} minutes! I'll remind you when it's time for a break. Stay focused! 📚🔥"
+
+# === Error Handlers ===
+@app.errorhandler(404)
+def not_found(error):
+    return "Command not found. Use !help for available commands.", 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return "Internal server error. Please try again later.", 500
+
+# === Cleanup Functions ===
+def cleanup_old_sessions():
+    """Clean up sessions older than 24 hours"""
+    try:
+        sessions = sessions_sheet.get_all_records()
+        now = datetime.now()
+        
+        rows_to_delete = []
+        for i, session in enumerate(sessions):
+            try:
+                last_activity = datetime.strptime(session['LastActivity'], "%Y-%m-%d %H:%M:%S")
+                time_diff = (now - last_activity).total_seconds() / 3600  # hours
+                
+                if time_diff >= 24:  # 24 hours old
+                    rows_to_delete.append(i + 2)  # +2 for header row
+            except:
+                continue
+        
+        # Delete old sessions (in reverse order to maintain indices)
+        for row_idx in reversed(rows_to_delete):
+            sessions_sheet.delete_rows(row_idx)
+            
+    except Exception as e:
+        print(f"Error cleaning up sessions: {e}")
+
+def cleanup_old_reminders():
+    """Clean up sent/expired reminders older than 7 days"""
+    try:
+        reminders = reminders_sheet.get_all_records()
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
+        rows_to_delete = []
+        for i, reminder in enumerate(reminders):
+            try:
+                reminder_time = datetime.strptime(reminder['ReminderTime'], "%Y-%m-%d %H:%M:%S")
+                if (reminder['Status'] == 'Sent' and reminder_time < one_week_ago):
+                    rows_to_delete.append(i + 2)
+            except:
+                continue
+        
+        # Delete old reminders
+        for row_idx in reversed(rows_to_delete):
+            reminders_sheet.delete_rows(row_idx)
+            
+    except Exception as e:
+        print(f"Error cleaning up reminders: {e}")
+
+# Schedule cleanup tasks
+scheduler.add_job(cleanup_old_sessions, 'interval', hours=6)  # Every 6 hours
+scheduler.add_job(cleanup_old_reminders, 'interval', hours=24)  # Daily
+
+# === Main Application ===
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
