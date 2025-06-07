@@ -293,63 +293,65 @@ def stop():
         userid = request.args.get('id', '')
         now = datetime.now()
 
-        # Get all active sessions
+        print(f"[STOP] Called by user: {username}, ID: {userid}")
+
         sessions = safe_get_all_records(sessions_sheet)
 
         for i, session in enumerate(sessions):
             if str(session.get('UserID')) == str(userid):
+                print(f"[STOP] Found session for {userid}")
+
+                start_str = session.get('StartTime')
+                if not start_str:
+                    print("[ERROR] StartTime is missing in session.")
+                    return "❌ Error: StartTime missing.", 500
+
                 try:
-                    # Parse and validate session start time
-                    start_str = session.get('StartTime')
-                    if not start_str:
-                        raise ValueError("Missing StartTime in session")
-
                     start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
-                    duration_minutes = int((now - start_time).total_seconds() / 60)
+                except Exception as e:
+                    print(f"[ERROR] Bad StartTime format: {e}")
+                    return "❌ Error: Bad StartTime format.", 500
 
-                    # Safely parse break time
-                    try:
-                        break_time = int(session.get('TotalBreakTime', 0))
-                    except:
-                        break_time = 0
+                duration_minutes = int((now - start_time).total_seconds() / 60)
 
-                    study_minutes = max(0, duration_minutes - break_time)
-                    xp_earned = study_minutes * 2
+                raw_break = session.get('TotalBreakTime', '0')
+                try:
+                    break_time = int(raw_break) if raw_break else 0
+                except:
+                    break_time = 0
 
-                    # Log to activities_sheet (must match exactly 8 columns)
-                    activities_sheet.append_row([
-                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-                        userid,
-                        username,
-                        "StudySession",
-                        xp_earned,
-                        f"{study_minutes} min",
-                        f"Studied for {study_minutes} minutes",
-                        now.strftime("%Y-%m")
-                    ])
+                study_minutes = max(0, duration_minutes - break_time)
+                xp_earned = study_minutes * 2
 
-                    # Update user XP
-                    update_user_xp(userid, xp_earned)
+                row_to_add = [
+                    now.strftime("%Y-%m-%d %H:%M:%S"),
+                    userid,
+                    username,
+                    "StudySession",
+                    xp_earned,
+                    f"{study_minutes} min",
+                    f"Studied for {study_minutes} minutes",
+                    now.strftime("%Y-%m")
+                ]
 
-                    # Delete the session row
-                    sessions_sheet.delete_rows(i + 2)
+                print(f"[STOP] Writing to activities_sheet: {row_to_add}")
+                activities_sheet.append_row(row_to_add)
 
-                    # Badge message if applicable
-                    badges = get_badges(study_minutes)
-                    badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
+                print(f"[STOP] Updating XP and deleting session row")
+                update_user_xp(userid, xp_earned)
+                sessions_sheet.delete_rows(i + 2)
 
-                    return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
+                badges = get_badges(study_minutes)
+                badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
 
-                except Exception as inner:
-                    print(f"[ERROR in session processing] {inner}")
-                    return "❌ Error processing your session data. Try !start again.", 500
+                return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
 
+        print("[STOP] No active session found")
         return f"⚠️ {username}, no active session found. Use !start first."
 
-    except Exception as outer:
-        print(f"[ERROR in /stop route] {outer}")
+    except Exception as e:
+        print(f"[ERROR in /stop route] {e}")
         return "❌ Server error while stopping session. Please try again.", 500
-
 
 
 @app.route("/working")
