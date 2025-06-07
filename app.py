@@ -93,7 +93,7 @@ def get_badges(total_minutes):
 def get_or_create_user(userid, username):
     """Get user data or create new user"""
     try:
-        users = users_sheet.get_all_records()
+        users = safe_get_all_records(users_sheet)
         for i, user in enumerate(users):
             if str(user['UserID']) == str(userid):
                 return i + 2, user  # Return row index and user data
