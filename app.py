@@ -26,7 +26,7 @@ scope = [
     'https://www.googleapis.com/auth/drive'
 ]
 client = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-workbook = client.open("StudyPlusData")
+workbook = client.open("StudyData")
 
 # Access different sheets
 users_sheet = workbook.worksheet("Users")
