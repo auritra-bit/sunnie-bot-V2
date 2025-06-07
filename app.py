@@ -308,58 +308,55 @@ def stop():
         sessions = safe_get_all_records(sessions_sheet)
 
         for i, session in enumerate(sessions):
-            if str(session.get('UserID')) == str(userid):
-                start_str = session.get('StartTime')
-                if not start_str or not start_str.strip():
-                    print(f"[ERROR] Missing StartTime for user {userid}")
-                    return f"⚠️ {username}, session has no start time. Use !start again.", 500
+            if str(session.get('UserID')) != str(userid):
+                continue  # Skip other users
 
-                try:
-                    start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
-                except Exception as e:
-                    print(f"[ERROR] Bad StartTime format: {e}")
-                    return "❌ Error: Invalid StartTime format.", 500
+            # Skip rows missing StartTime
+            start_str = session.get('StartTime', '').strip()
+            if not start_str:
+                print(f"[WARN] Skipping session row with missing StartTime at row {i+2}")
+                continue
 
-                duration_minutes = int((now - start_time).total_seconds() / 60)
+            try:
+                start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+            except Exception as e:
+                print(f"[WARN] Bad StartTime format: {start_str} — {e}")
+                continue
 
-                raw_break = session.get('TotalBreakTime', '0')
-                try:
-                    break_time = int(raw_break) if raw_break else 0
-                except:
-                    break_time = 0
+            duration_minutes = int((now - start_time).total_seconds() / 60)
 
-                study_minutes = max(0, duration_minutes - break_time)
-                xp_earned = study_minutes * 2
+            try:
+                break_time = int(session.get('TotalBreakTime', 0)) or 0
+            except:
+                break_time = 0
 
-                # Log in activities sheet
-                activities_sheet.append_row([
-                    now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-                    userid,                             # UserID
-                    username,                           # Username
-                    "StudySession",                     # Action
-                    xp_earned,                          # XPEarned
-                    f"{study_minutes} min",            # Duration
-                    f"Studied for {study_minutes} minutes",  # Details
-                    now.strftime("%Y-%m")               # Month
-                ])
-                print(f"[STOP] Logged to activities: {username}, {study_minutes}min")
+            study_minutes = max(0, duration_minutes - break_time)
+            xp_earned = study_minutes * 2
 
-                # Update XP
-                update_user_xp(userid, xp_earned)
+            # Log to activities
+            activities_sheet.append_row([
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                userid,
+                username,
+                "StudySession",
+                xp_earned,
+                f"{study_minutes} min",
+                f"Studied for {study_minutes} minutes",
+                now.strftime("%Y-%m")
+            ])
+            update_user_xp(userid, xp_earned)
+            sessions_sheet.delete_rows(i + 2)
 
-                # Delete session row
-                sessions_sheet.delete_rows(i + 2)
+            badges = get_badges(study_minutes)
+            badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
 
-                badges = get_badges(study_minutes)
-                badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
-
-                return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
+            return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
 
         return f"⚠️ {username}, no active session found. Use !start first."
 
     except Exception as e:
         print(f"[ERROR in /stop] {e}")
-        return "❌ Failed to stop session. Please try again.", 500
+        return "❌ Failed to stop session. Try again.", 500
 
 
 
