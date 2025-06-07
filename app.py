@@ -120,10 +120,15 @@ def get_youtube_service():
 # Initialize YouTube service
 youtube_service = None
 if os.path.exists(YOUTUBE_CLIENT_SECRET) or os.getenv('YOUTUBE_CLIENT_SECRET_JSON'):
+    print("🔁 Attempting to initialize YouTube service...")
     try:
         youtube_service = get_youtube_service()
+        if youtube_service:
+            print("✅ YouTube service authenticated")
+        else:
+            print("❌ YouTube service returned None")
     except Exception as e:
-        print(f"YouTube API init failed: {str(e)}")
+        print(f"❌ YouTube API init failed: {str(e)}")
 
 # ========== Core Bot Functionality ==========
 class StudyBot:
