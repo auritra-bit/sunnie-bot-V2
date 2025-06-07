@@ -153,7 +153,7 @@ def calculate_streak(userid):
 def check_session_activity():
     """Background task to check for inactive sessions"""
     try:
-        sessions = sessions_sheet.get_all_records()
+        sessions = safe_get_all_records(sessions_sheet)
         now = datetime.now()
         
         for i, session in enumerate(sessions):
