@@ -295,48 +295,61 @@ def stop():
 
         # Get all active sessions
         sessions = safe_get_all_records(sessions_sheet)
+
         for i, session in enumerate(sessions):
-            if str(session['UserID']) == str(userid):
-                # Parse session start time
-                start_time = datetime.strptime(session['StartTime'], "%Y-%m-%d %H:%M:%S")
-                duration_minutes = int((now - start_time).total_seconds() / 60)
+            if str(session.get('UserID')) == str(userid):
+                try:
+                    # Parse and validate session start time
+                    start_str = session.get('StartTime')
+                    if not start_str:
+                        raise ValueError("Missing StartTime in session")
 
-                # Subtract any break time
-                break_time = int(session.get('TotalBreakTime', 0))
-                study_minutes = max(0, duration_minutes - break_time)
+                    start_time = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S")
+                    duration_minutes = int((now - start_time).total_seconds() / 60)
 
-                # XP calculation
-                xp_earned = study_minutes * 2
+                    # Safely parse break time
+                    try:
+                        break_time = int(session.get('TotalBreakTime', 0))
+                    except:
+                        break_time = 0
 
-                # ✅ Log session result in ACTIVITIES sheet
-                activities_sheet.append_row([
-                    now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
-                    userid,
-                    username,
-                    "StudySession",
-                    xp_earned,
-                    f"{study_minutes} min",
-                    f"Studied for {study_minutes} minutes",
-                    now.strftime("%Y-%m")
-                ])
+                    study_minutes = max(0, duration_minutes - break_time)
+                    xp_earned = study_minutes * 2
 
-                # Update user XP
-                update_user_xp(userid, xp_earned)
+                    # Log to activities_sheet (must match exactly 8 columns)
+                    activities_sheet.append_row([
+                        now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+                        userid,
+                        username,
+                        "StudySession",
+                        xp_earned,
+                        f"{study_minutes} min",
+                        f"Studied for {study_minutes} minutes",
+                        now.strftime("%Y-%m")
+                    ])
 
-                # ✅ Delete the session from sessions_sheet
-                sessions_sheet.delete_rows(i + 2)
+                    # Update user XP
+                    update_user_xp(userid, xp_earned)
 
-                # Badges check
-                badges = get_badges(study_minutes)
-                badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
+                    # Delete the session row
+                    sessions_sheet.delete_rows(i + 2)
 
-                return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
+                    # Badge message if applicable
+                    badges = get_badges(study_minutes)
+                    badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
+
+                    return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
+
+                except Exception as inner:
+                    print(f"[ERROR in session processing] {inner}")
+                    return "❌ Error processing your session data. Try !start again.", 500
 
         return f"⚠️ {username}, no active session found. Use !start first."
 
-    except Exception as e:
-        print(f"[ERROR in /stop] {e}")
-        return "❌ An error occurred while stopping your session. Please try again.", 500
+    except Exception as outer:
+        print(f"[ERROR in /stop route] {outer}")
+        return "❌ Server error while stopping session. Please try again.", 500
+
 
 
 @app.route("/working")
