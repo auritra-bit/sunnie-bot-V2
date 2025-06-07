@@ -123,7 +123,7 @@ def update_user_xp(userid, xp_to_add):
 def calculate_streak(userid):
     """Calculate daily attendance streak"""
     try:
-        activities = activities_sheet.get_all_records()
+        activities = safe_get_all_records(activities_sheet)
         dates = set()
         for activity in activities:
             if str(activity['UserID']) == str(userid) and activity['Action'] == 'Attendance':
