@@ -323,9 +323,9 @@ def stop():
             if str(session.get('UserID')) != str(userid):
                 continue
 
-            start_str = session.get('StartTime', '').strip()
-            if not start_str:
-                print(f"[WARN] Skipping session with missing StartTime at row {i+2}")
+            start_str = str(session.get('StartTime', '')).strip()
+            if not re.match(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', start_str):
+                print(f"[WARN] Bad or missing StartTime: '{start_str}' — skipping row {i+2}")
                 continue
 
             try:
