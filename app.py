@@ -1,4 +1,5 @@
 import os
+import base64
 import re
 import time
 import json
@@ -15,6 +16,11 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.oauth2 import service_account
+
+# ========== Decode YouTube Token from ENV ==========
+if os.getenv('YOUTUBE_TOKEN_BASE64'):
+    with open('youtube_token.json', 'w') as f:
+        f.write(base64.b64decode(os.getenv('YOUTUBE_TOKEN_BASE64')).decode())
 
 app = Flask(__name__)
 
