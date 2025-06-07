@@ -955,7 +955,7 @@ def full_leaderboard():
             title = "📅 Monthly Leaderboard (Top 10):"
             
         else:  # all-time
-            users = users_sheet.get_all_records()
+            users = safe_get_all_records(users_sheet)
             sorted_users = [(u['Username'], int(u.get('TotalXP', 0))) for u in users]
             sorted_users = sorted(sorted_users, key=lambda x: x[1], reverse=True)[:10]
             title = "🏆 All-Time Leaderboard (Top 10):"
