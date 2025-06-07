@@ -42,6 +42,17 @@ plans_sheet = workbook.worksheet("Plans")
 HF_API_URL = "https://api-inference.huggingface.co/models/microsoft/DialoGPT-medium"
 HF_HEADERS = {"Authorization": "Bearer YOUR_HF_TOKEN"}  # Replace with your HF token
 
+def safe_get_all_records(sheet):
+    try:
+        values = sheet.get_all_values()
+        if len(values) < 2:
+            return []  # Only headers, no data
+        return sheet.get_all_records()
+    except Exception as e:
+        print(f"Error reading sheet: {e}")
+        return []
+
+
 def get_ai_response(prompt, max_chars=180):
     """Get AI response using Hugging Face free API"""
     try:
@@ -262,7 +273,7 @@ def start():
     now = datetime.now()
 
     # Check if session already active
-    sessions = sessions_sheet.get_all_records()
+    sessions = safe_get_all_records(sessions_sheet)
     for session in sessions:
         if str(session['UserID']) == str(userid):
             return f"⚠️ {username}, session already active! Use !stop first."
