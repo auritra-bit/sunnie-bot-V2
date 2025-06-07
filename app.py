@@ -479,6 +479,10 @@ class StudyBot:
                     self.send_message(reminder['UserID'], f"🔔 {reminder['Username']}, reminder: {reminder['Message']}")
                     reminders_sheet.update_cell(i + 2, reminders_sheet.find("Status").col, "Sent")
                     break
+
+    def send_scheduled_reminders(self):
+    print("Scheduled reminder check placeholder (to be implemented)")
+
     
     # ===== Task System =====
     def add_task(self, username, userid, args):
