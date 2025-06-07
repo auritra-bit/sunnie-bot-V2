@@ -288,43 +288,56 @@ def start():
 
 @app.route("/stop")
 def stop():
-    username = request.args.get('user', '')
-    userid = request.args.get('id', '')
-    now = datetime.now()
+    try:
+        username = request.args.get('user', '')
+        userid = request.args.get('id', '')
+        now = datetime.now()
 
-    # Find active session
-    sessions = safe_get_all_records(sessions_sheet)
-    for i, session in enumerate(sessions):
-        if str(session['UserID']) == str(userid):
-            start_time = datetime.strptime(session['StartTime'], "%Y-%m-%d %H:%M:%S")
-            duration_minutes = int((now - start_time).total_seconds() / 60)
-            
-            # Calculate XP (minus break time)
-            break_time = int(session.get('TotalBreakTime', 0))
-            study_minutes = max(0, duration_minutes - break_time)
-            xp_earned = study_minutes * 2
+        # Get all active sessions
+        sessions = safe_get_all_records(sessions_sheet)
+        for i, session in enumerate(sessions):
+            if str(session['UserID']) == str(userid):
+                # Parse session start time
+                start_time = datetime.strptime(session['StartTime'], "%Y-%m-%d %H:%M:%S")
+                duration_minutes = int((now - start_time).total_seconds() / 60)
 
-            # Log study session
-            activities_sheet.append_row([
-                now.strftime("%Y-%m-%d %H:%M:%S"), userid, username,
-                "StudySession", xp_earned, f"{study_minutes} min",
-                f"Studied for {study_minutes} minutes", now.strftime("%Y-%m")
-            ])
+                # Subtract any break time
+                break_time = int(session.get('TotalBreakTime', 0))
+                study_minutes = max(0, duration_minutes - break_time)
 
-            
-            # Update user data
-            update_user_xp(userid, xp_earned)
-            
-            # Remove session
-            sessions_sheet.delete_rows(i + 2)
-            
-            # Check for badges
-            badges = get_badges(study_minutes)
-            badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
-            
-            return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
-    
-    return f"⚠️ {username}, no active session found. Use !start first."
+                # XP calculation
+                xp_earned = study_minutes * 2
+
+                # ✅ Log session result in ACTIVITIES sheet
+                activities_sheet.append_row([
+                    now.strftime("%Y-%m-%d %H:%M:%S"),  # Timestamp
+                    userid,
+                    username,
+                    "StudySession",
+                    xp_earned,
+                    f"{study_minutes} min",
+                    f"Studied for {study_minutes} minutes",
+                    now.strftime("%Y-%m")
+                ])
+
+                # Update user XP
+                update_user_xp(userid, xp_earned)
+
+                # ✅ Delete the session from sessions_sheet
+                sessions_sheet.delete_rows(i + 2)
+
+                # Badges check
+                badges = get_badges(study_minutes)
+                badge_msg = f" 🎖️ Badge unlocked: {badges[-1]}!" if badges else ""
+
+                return f"🎓 {username}, studied {study_minutes}min, earned {xp_earned} XP!{badge_msg}"
+
+        return f"⚠️ {username}, no active session found. Use !start first."
+
+    except Exception as e:
+        print(f"[ERROR in /stop] {e}")
+        return "❌ An error occurred while stopping your session. Please try again.", 500
+
 
 @app.route("/working")
 def working():
