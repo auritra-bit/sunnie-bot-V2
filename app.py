@@ -245,7 +245,7 @@ def attend():
     today_date = now.date()
 
     # Check if already attended today
-    activities = activities_sheet.get_all_records()
+    activities = safe_get_all_records(activities_sheet)
     for activity in activities[::-1]:
         if (str(activity['UserID']) == str(userid) and 
             activity['Action'] == 'Attendance' and
@@ -293,7 +293,7 @@ def stop():
     now = datetime.now()
 
     # Find active session
-    sessions = sessions_sheet.get_all_records()
+    sessions = safe_get_all_records(sessions_sheet)
     for i, session in enumerate(sessions):
         if str(session['UserID']) == str(userid):
             start_time = datetime.strptime(session['StartTime'], "%Y-%m-%d %H:%M:%S")
@@ -332,7 +332,7 @@ def working():
     now = datetime.now()
 
     # Update session activity
-    sessions = sessions_sheet.get_all_records()
+    sessions = safe_get_all_records(sessions_sheet)
     for i, session in enumerate(sessions):
         if str(session['UserID']) == str(userid):
             sessions_sheet.update_cell(i + 2, 4, now.strftime("%Y-%m-%d %H:%M:%S"))  # LastActivity
@@ -356,7 +356,7 @@ def take_break():
     break_end = now + timedelta(minutes=duration)
     
     # Update session with break
-    sessions = sessions_sheet.get_all_records()
+    sessions = safe_get_all_records(sessions_sheet)
     for i, session in enumerate(sessions):
         if str(session['UserID']) == str(userid):
             current_break = int(session.get('TotalBreakTime', 0))
@@ -420,7 +420,7 @@ def add_task():
         return f"⚠️ {username}, specify your task! E.g., !task Physics Chapter 5"
 
     # Check for active tasks
-    tasks = tasks_sheet.get_all_records()
+    tasks = safe_get_all_records(tasks_sheet)
     active_tasks = [t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Active']
     
     if active_tasks:
@@ -441,7 +441,7 @@ def mark_done():
     userid = request.args.get('id', '')
 
     # Find active task
-    tasks = tasks_sheet.get_all_records()
+    tasks = safe_get_all_records(tasks_sheet)
     for i, task in enumerate(tasks):
         if str(task['UserID']) == str(userid) and task['Status'] == 'Active':
             # Mark as completed
@@ -469,7 +469,7 @@ def remove_task():
     userid = request.args.get('id', '')
 
     # Find active task
-    tasks = tasks_sheet.get_all_records()
+    tasks = safe_get_all_records(tasks_sheet)
     for i, task in enumerate(tasks):
         if str(task['UserID']) == str(userid) and task['Status'] == 'Active':
             # Mark as removed
@@ -484,7 +484,7 @@ def completed_tasks():
     userid = request.args.get('id', '')
 
     # Get last 3 completed tasks
-    tasks = tasks_sheet.get_all_records()
+    tasks = safe_get_all_records(tasks_sheet)
     completed = [t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Completed']
     recent_tasks = sorted(completed, key=lambda x: x['CompletedDate'], reverse=True)[:3]
     
@@ -504,7 +504,7 @@ def pending_task():
     userid = request.args.get('id', '')
 
     # Find active task
-    tasks = tasks_sheet.get_all_records()
+    tasks = safe_get_all_records(tasks_sheet)
     for task in tasks:
         if str(task['UserID']) == str(userid) and task['Status'] == 'Active':
             return f"🕒 {username}, your current task: '{task['TaskName']}' - Use !done to complete"
@@ -524,7 +524,7 @@ def rank():
 @app.route("/top")
 def leaderboard():
     try:
-        users = users_sheet.get_all_records()
+        users = safe_get_all_records(users_sheet)
         sorted_users = sorted(users, key=lambda x: int(x.get('TotalXP', 0)), reverse=True)[:5]
         
         response = "🏆 Top 5 Learners:\n"
@@ -539,7 +539,7 @@ def leaderboard():
 def weekly_top():
     try:
         one_week_ago = datetime.now() - timedelta(days=7)
-        activities = activities_sheet.get_all_records()
+        activities = safe_get_all_records(activities_sheet)
         
         weekly_xp = {}
         for activity in activities:
@@ -566,7 +566,7 @@ def weekly_top():
 def monthly_top():
     try:
         current_month = datetime.now().strftime("%Y-%m")
-        activities = activities_sheet.get_all_records()
+        activities = safe_get_all_records(activities_sheet)
         
         monthly_xp = {}
         for activity in activities:
@@ -600,7 +600,7 @@ def goal():
         return f"🎯 {username}, goal set: '{msg.strip()}' - Use !complete to mark achieved!"
     else:
         # Show current goal
-        goals = goals_sheet.get_all_records()
+        goals = safe_get_all_records(goals_sheet)
         for goal in goals[::-1]:
             if str(goal['UserID']) == str(userid) and goal['Status'] == 'Active':
                 return f"🎯 {username}, current goal: '{goal['Goal']}' - Use !complete to mark achieved!"
@@ -612,7 +612,7 @@ def complete_goal():
     userid = request.args.get('id', '')
 
     # Find active goal
-    goals = goals_sheet.get_all_records()
+    goals = safe_get_all_records(goals_sheet)
     for i, goal in enumerate(goals):
         if str(goal['UserID']) == str(userid) and goal['Status'] == 'Active':
             # Mark as completed
@@ -643,7 +643,7 @@ def summary():
             return f"⚠️ Error loading summary"
         
         # Get tasks data
-        tasks = tasks_sheet.get_all_records()
+        tasks = safe_get_all_records(tasks_sheet)
         completed_tasks = len([t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Completed'])
         pending_tasks = len([t for t in tasks if str(t['UserID']) == str(userid) and t['Status'] == 'Active'])
         
@@ -689,7 +689,7 @@ def my_plans():
     userid = request.args.get('id', '')
     
     try:
-        plans = plans_sheet.get_all_records()
+        plans = safe_get_all_records(plans_sheet)
         user_plans = [p for p in plans if str(p['UserID']) == str(userid)]
         recent_plans = sorted(user_plans, key=lambda x: x['CreatedDate'], reverse=True)[:3]
         
@@ -868,7 +868,7 @@ def detailed_stats():
         
         # Get this week's activity
         one_week_ago = datetime.now() - timedelta(days=7)
-        activities = activities_sheet.get_all_records()
+        activities = safe_get_all_records(activities_sheet)
         
         weekly_xp = 0
         weekly_minutes = 0
@@ -924,7 +924,7 @@ def full_leaderboard():
     try:
         if type_param == 'weekly':
             one_week_ago = datetime.now() - timedelta(days=7)
-            activities = activities_sheet.get_all_records()
+            activities = safe_get_all_records(activities_sheet)
             
             weekly_xp = {}
             for activity in activities:
@@ -942,7 +942,7 @@ def full_leaderboard():
             
         elif type_param == 'monthly':
             current_month = datetime.now().strftime("%Y-%m")
-            activities = activities_sheet.get_all_records()
+            activities = safe_get_all_records(activities_sheet)
             
             monthly_xp = {}
             for activity in activities:
@@ -1053,7 +1053,7 @@ def internal_error(error):
 def cleanup_old_sessions():
     """Clean up sessions older than 24 hours"""
     try:
-        sessions = sessions_sheet.get_all_records()
+        sessions = safe_get_all_records(sessions_sheet)
         now = datetime.now()
         
         rows_to_delete = []
@@ -1077,7 +1077,7 @@ def cleanup_old_sessions():
 def cleanup_old_reminders():
     """Clean up sent/expired reminders older than 7 days"""
     try:
-        reminders = reminders_sheet.get_all_records()
+        reminders = safe_get_all_records(reminders_sheet)
         one_week_ago = datetime.now() - timedelta(days=7)
         
         rows_to_delete = []
