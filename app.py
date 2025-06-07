@@ -481,7 +481,7 @@ class StudyBot:
                     break
 
     def send_scheduled_reminders(self):
-    print("Scheduled reminder check placeholder (to be implemented)")
+        print("Scheduled reminder check placeholder (to be implemented)")
 
     
     # ===== Task System =====
