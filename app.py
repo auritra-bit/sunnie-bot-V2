@@ -130,6 +130,66 @@ if os.path.exists(YOUTUBE_CLIENT_SECRET) or os.getenv('YOUTUBE_CLIENT_SECRET_JSO
     except Exception as e:
         print(f"❌ YouTube API init failed: {str(e)}")
 
+# ========== Start monitoring chat in background ==========
+if youtube_service:
+    threading.Thread(target=monitor_chat, daemon=True).start()
+
+def send_message(live_chat_id, text):
+    youtube_service.liveChatMessages().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "liveChatId": live_chat_id,
+                "type": "textMessageEvent",
+                "textMessageDetails": {
+                    "messageText": text
+                }
+            }
+        }
+    ).execute()
+
+def monitor_chat():
+    try:
+        # Step 1: Get active livestream chat ID
+        live_broadcasts = youtube_service.liveBroadcasts().list(
+            part="snippet",
+            broadcastStatus="active",
+            mine=True
+        ).execute()
+
+        if not live_broadcasts["items"]:
+            print("❌ No active livestream found.")
+            return
+
+        live_chat_id = live_broadcasts["items"][0]["snippet"]["liveChatId"]
+        print(f"✅ Connected to chat: {live_chat_id}")
+
+        next_page_token = None
+
+        while True:
+            response = youtube_service.liveChatMessages().list(
+                liveChatId=live_chat_id,
+                part="snippet,authorDetails",
+                pageToken=next_page_token
+            ).execute()
+
+            for item in response.get("items", []):
+                author = item["authorDetails"]["displayName"]
+                message = item["snippet"]["displayMessage"]
+                print(f"{author}: {message}")
+
+                if message.strip().lower().startswith("!start"):
+                    send_message(live_chat_id, f"✅ @{author}, your study session has started!")
+                elif message.strip().lower().startswith("!break"):
+                    send_message(live_chat_id, f"☕ @{author}, you're on a break!")
+
+            next_page_token = response.get("nextPageToken")
+            time.sleep(5)  # avoid rate limits
+
+    except Exception as e:
+        print(f"❌ Error in monitor_chat: {e}")
+
+
 # ========== Core Bot Functionality ==========
 class StudyBot:
     def __init__(self):
