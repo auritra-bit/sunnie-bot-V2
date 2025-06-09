@@ -341,31 +341,34 @@ def mark_done():
     username = request.args.get('user') or ""
     userid = request.args.get('id') or ""
 
-    # Find latest active task
+    # Step 1: Get user's current cached records
     user_records = get_user_records(userid)
+
+    # Step 2: Find the last active task
     for i, row in enumerate(reversed(user_records)):
         action = row.get('Action', '')
         if action.startswith("Task:") and "✅ Done" not in action:
             task_name = action[6:]
-            row_index = len(user_records) - i
-            
-            # Mark as done
+            row_index = len(user_records) - i  # Correct index in the sheet
+
+            # Step 3: Mark the task as done
             executor.submit(
                 async_update_cell, 
                 row_index + 1, 4, 
                 f"Task: {task_name} ✅ Done"
             )
-            
-            # Add XP
+
+            # Step 4: Add XP
             executor.submit(
                 async_append_row,
                 [username, userid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                  "Task Completed", "15", "", "", ""]
             )
-            
-            # Invalidate user cache immediately
+
+            # Step 5: Invalidate & refresh the cache
             invalidate_user_cache(userid)
-            
+            refresh_cache()  # ← Force refresh of entire cache
+
             return f"✅ {username}, task completed! +15 XP"
 
     return f"⚠️ {username}, no active tasks found."
