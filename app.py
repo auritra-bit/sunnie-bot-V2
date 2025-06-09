@@ -34,19 +34,22 @@ CACHE_TTL = 60  # 1 minute cache
 cache_lock = Lock()
 cached_records = []
 last_updated = 0
+user_cache = {}  # Separate cache for user-specific data
 
 # Thread pool for async writes
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
 
 def refresh_cache():
     """Refresh the cache with latest data from Google Sheets"""
-    global cached_records, last_updated
+    global cached_records, last_updated, user_cache
     start_time = time.time()
     
     with cache_lock:
         try:
             cached_records = sheet.get_all_records()
             last_updated = time.time()
+            # Clear user-specific cache
+            user_cache = {}
             logger.info(f"Cache refreshed in {time.time()-start_time:.2f}s")
             return True
         except Exception as e:
@@ -67,24 +70,24 @@ def get_cached_records():
     
     return cached_records
 
-# Background cache updater
-def cache_updater():
-    """Periodically update cache in background"""
-    while True:
-        time.sleep(CACHE_TTL)
-        try:
-            refresh_cache()
-        except Exception as e:
-            logger.error(f"Background cache update failed: {str(e)}")
-
-# Start background thread
-Thread(target=cache_updater, daemon=True).start()
-
-# === Helper Functions ===
 def get_user_records(userid):
-    """Get records for specific user"""
+    """Get records for specific user with caching"""
+    # Check if we have cached user records
+    if userid in user_cache:
+        return user_cache[userid]
+    
     records = get_cached_records()
-    return [r for r in records if str(r.get('UserID', '')) == str(userid)]
+    user_records = [r for r in records if str(r.get('UserID', '')) == str(userid)]
+    
+    # Cache user records
+    user_cache[userid] = user_records
+    return user_records
+
+def invalidate_user_cache(userid):
+    """Invalidate cache for specific user"""
+    if userid in user_cache:
+        del user_cache[userid]
+        logger.info(f"Invalidated cache for user {userid}")
 
 def async_append_row(row_data):
     """Append row asynchronously and refresh cache"""
@@ -193,6 +196,7 @@ def attend():
         async_append_row,
         [username, userid, timestamp, "Attendance", "10", "", "", ""]
     )
+    invalidate_user_cache(userid)  # Invalidate user cache
     
     streak = calculate_streak(userid)
     return f"✅ {username}, attendance logged +10 XP! 🔥 Streak: {streak} days."
@@ -214,6 +218,7 @@ def start():
         async_append_row,
         [username, userid, now, "Session Start", "0", "", "", ""]
     )
+    invalidate_user_cache(userid)  # Invalidate user cache
     return f"⏱️ {username}, study session started! Use `!stop` to end."
 
 @app.route("/stop")
@@ -259,6 +264,7 @@ def stop():
 
     # Mark session as completed
     executor.submit(async_update_cell, row_index + 1, 4, "Session Start ✅")
+    invalidate_user_cache(userid)  # Invalidate user cache
 
     # Check badges
     badges = get_badges(duration_minutes)
@@ -316,7 +322,8 @@ def add_task():
     # Check existing tasks
     user_records = get_user_records(userid)
     for row in reversed(user_records):
-        if row.get('Action', '').startswith("Task:") and "✅ Done" not in row.get('Action', ''):
+        action = row.get('Action', '')
+        if action.startswith("Task:") and "✅ Done" not in action:
             return f"⚠️ {username}, complete previous task first."
 
     # Add new task
@@ -326,6 +333,7 @@ def add_task():
         [username, userid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
          f"Task: {task_name}", "0", "", "", ""]
     )
+    invalidate_user_cache(userid)  # Invalidate user cache
     return f"✏️ {username}, task added: '{task_name}'"
 
 @app.route("/done")
@@ -355,6 +363,9 @@ def mark_done():
                  "Task Completed", "15", "", "", ""]
             )
             
+            # Invalidate user cache immediately
+            invalidate_user_cache(userid)
+            
             return f"✅ {username}, task completed! +15 XP"
 
     return f"⚠️ {username}, no active tasks found."
@@ -367,13 +378,15 @@ def remove_task():
     # Find latest active task
     user_records = get_user_records(userid)
     for i, row in enumerate(reversed(user_records)):
-        if row.get('Action', '').startswith("Task:") and "✅ Done" not in row.get('Action', ''):
+        action = row.get('Action', '')
+        if action.startswith("Task:") and "✅ Done" not in action:
             row_index = len(user_records) - i
-            task_name = row.get('Action', '')[6:]
+            task_name = action[6:]
             
             try:
                 sheet.delete_rows(row_index + 1)
                 refresh_cache()
+                invalidate_user_cache(userid)
                 return f"🗑️ {username}, task removed."
             except Exception as e:
                 logger.error(f"Task deletion failed: {str(e)}")
@@ -422,6 +435,7 @@ def goal():
             async_append_row,
             [username, userid, now, "Set Goal", "0", "", "", "", msg.strip()]
         )
+        invalidate_user_cache(userid)
         return f"🎯 {username}, goal set: {msg.strip()}"
     else:
         # Show existing goal
@@ -444,6 +458,7 @@ def complete_goal():
                 row_index + 1, 9, 
                 ""
             )
+            invalidate_user_cache(userid)
             return f"🎉 {username}, goal achieved!"
 
     return f"⚠️ {username}, no active goal."
