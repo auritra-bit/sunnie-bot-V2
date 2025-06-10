@@ -395,26 +395,14 @@ def summary():
                 elif row['Status'] == 'Pending':
                     pending_tasks += 1
 
-        # Get goal counts
-        goal_records = goal_sheet.get_all_records()
-        completed_goals = 0
-        pending_goals = 0
-        for row in goal_records:
-            if str(row.get('UserID', '')) == str(userid):
-                if row.get('Status', '') == 'Completed':
-                    completed_goals += 1
-                elif row.get('Status', '') == 'Pending':
-                    pending_goals += 1
-
+        
         hours = total_minutes // 60
         minutes = total_minutes % 60
         return (f"📊 {username}'s Summary:\n"
                 f"⏱️ Total Study Time: {hours}h {minutes}m\n"
                 f"⚜️ Total XP: {total_xp}\n"
                 f"✅ Completed Tasks: {completed_tasks}\n"
-                f"🕒 Pending Tasks: {pending_tasks}\n"
-                f"🎯 Completed Goals: {completed_goals}\n"
-                f"🎪 Pending Goals: {pending_goals}")
+                f"🕒 Pending Tasks: {pending_tasks}")
     except Exception as e:
         return f"⚠️ Error generating summary: {str(e)}"
 
