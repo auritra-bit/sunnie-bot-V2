@@ -3,15 +3,8 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 import time
-from threading import Thread, Lock
+from threading import Thread
 import os
-from functools import lru_cache
-import concurrent.futures
-import logging
-
-# Initialize logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -21,98 +14,87 @@ scope = [
     'https://spreadsheets.google.com/feeds',
     'https://www.googleapis.com/auth/drive'
 ]
-try:
-    client = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
-    sheet = client.open("StudyPlusData").sheet1
-    logger.info("Connected to Google Sheets successfully")
-except Exception as e:
-    logger.error(f"Failed to connect to Google Sheets: {str(e)}")
-    raise
+client = gspread.service_account(filename=SERVICE_ACCOUNT_FILE)
+spreadsheet = client.open("StudyPlusData")
 
-# === Caching System ===
-CACHE_TTL = 60  # 1 minute cache
-cache_lock = Lock()
-cached_records = []
-last_updated = 0
-user_cache = {}  # Separate cache for user-specific data
+# Define separate sheets
+attendance_sheet = spreadsheet.worksheet("attendance")
+session_sheet = spreadsheet.worksheet("session") 
+task_sheet = spreadsheet.worksheet("task")
+xp_sheet = spreadsheet.worksheet("xp")
 
-# Thread pool for async writes
-executor = concurrent.futures.ThreadPoolExecutor(max_workers=10)
-
-def refresh_cache():
-    """Refresh the cache with latest data from Google Sheets"""
-    global cached_records, last_updated, user_cache
-    start_time = time.time()
-    
-    with cache_lock:
-        try:
-            cached_records = sheet.get_all_records()
-            last_updated = time.time()
-            # Clear user-specific cache
-            user_cache = {}
-            logger.info(f"Cache refreshed in {time.time()-start_time:.2f}s")
-            return True
-        except Exception as e:
-            logger.error(f"Cache refresh failed: {str(e)}")
-            return False
-
-def get_cached_records():
-    """Get cached records, refresh if stale"""
-    global last_updated
-    current_time = time.time()
-    
-    # If cache is empty or expired
-    if current_time - last_updated > CACHE_TTL or not cached_records:
-        logger.info("Cache stale, refreshing...")
-        if not refresh_cache():
-            # Return empty list if refresh fails
-            return []
-    
-    return cached_records
-
-def get_user_records(userid):
-    """Get records for specific user with caching"""
-    # Check if we have cached user records
-    if userid in user_cache:
-        return user_cache[userid]
-    
-    records = get_cached_records()
-    user_records = [r for r in records if str(r.get('UserID', '')) == str(userid)]
-    
-    # Cache user records
-    user_cache[userid] = user_records
-    return user_records
-
-def invalidate_user_cache(userid):
-    """Invalidate cache for specific user"""
-    if userid in user_cache:
-        del user_cache[userid]
-        logger.info(f"Invalidated cache for user {userid}")
-
-def async_append_row(row_data):
-    """Append row asynchronously and refresh cache"""
+# === Helper Functions ===
+def update_user_xp(username, userid, xp_earned, action_type):
+    """Update or create user XP record in the xp sheet"""
     try:
-        sheet.append_row(row_data)
-        logger.info(f"Appended row: {row_data[:3]}...")
-        refresh_cache()
-        return True
+        records = xp_sheet.get_all_records()
+        user_found = False
+        
+        for i, row in enumerate(records):
+            if str(row['UserID']) == str(userid):
+                # Update existing user
+                current_xp = int(row.get('TotalXP', 0))
+                new_total = current_xp + int(xp_earned)
+                xp_sheet.update_cell(i + 2, 3, new_total)  # TotalXP column
+                xp_sheet.update_cell(i + 2, 4, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))  # LastUpdated
+                user_found = True
+                break
+        
+        if not user_found:
+            # Add new user
+            xp_sheet.append_row([
+                username,
+                userid,
+                int(xp_earned),
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            ])
     except Exception as e:
-        logger.error(f"Async append failed: {str(e)}")
-        return False
+        print(f"Error updating XP: {e}")
 
-def async_update_cell(row, col, value):
-    """Update cell asynchronously and refresh cache"""
+
+def get_user_total_xp(userid):
+    """Get user's total XP from xp sheet"""
     try:
-        sheet.update_cell(row, col, value)
-        logger.info(f"Updated cell ({row},{col}) = {value}")
-        refresh_cache()
-        return True
-    except Exception as e:
-        logger.error(f"Async update failed: {str(e)}")
-        return False
+        records = xp_sheet.get_all_records()
+        for row in records:
+            if str(row['UserID']) == str(userid):
+                return int(row.get('TotalXP', 0))
+        return 0
+    except:
+        return 0
+
+
+def calculate_streak(userid):
+    """Calculate daily streak from attendance sheet"""
+    try:
+        records = attendance_sheet.get_all_records()
+        dates = set()
+        for row in records:
+            if str(row['UserID']) == str(userid):
+                try:
+                    date = datetime.strptime(str(row['Date']), "%Y-%m-%d %H:%M:%S").date()
+                    dates.add(date)
+                except ValueError:
+                    pass
+
+        if not dates:
+            return 0
+
+        streak = 0
+        today = datetime.now().date()
+
+        for i in range(0, 365):
+            day = today - timedelta(days=i)
+            if day in dates:
+                streak += 1
+            else:
+                break
+        return streak
+    except:
+        return 0
+
 
 # === Rank System ===
-@lru_cache(maxsize=512)
 def get_rank(xp):
     xp = int(xp)
     if xp >= 500:
@@ -126,8 +108,8 @@ def get_rank(xp):
     else:
         return "🍼 Newbie"
 
+
 # === Badge System ===
-@lru_cache(maxsize=512)
 def get_badges(total_minutes):
     badges = []
     if total_minutes >= 50:
@@ -140,420 +122,347 @@ def get_badges(total_minutes):
         badges.append("🔷 Diamond Crown")
     return badges
 
-# === Daily Streak ===
-@lru_cache(maxsize=512)
-def calculate_streak(userid):
-    user_records = get_user_records(userid)
-    dates = set()
-    
-    for row in user_records:
-        if row.get('Action') == 'Attendance':
-            try:
-                date_str = str(row.get('Timestamp', ''))
-                if len(date_str) >= 10:  # Minimum valid date length
-                    date = datetime.strptime(date_str[:19], "%Y-%m-%d %H:%M:%S").date()
-                    dates.add(date)
-            except (ValueError, TypeError):
-                continue
-
-    if not dates:
-        return 0
-
-    streak = 0
-    today = datetime.now().date()
-    current_date = today
-
-    # Check consecutive days from today backwards
-    while current_date in dates:
-        streak += 1
-        current_date -= timedelta(days=1)
-        
-    return streak
 
 # === ROUTES ===
+
+# ✅ !attend
 @app.route("/attend")
 def attend():
     username = request.args.get('user') or ""
     userid = request.args.get('id') or ""
-    today_date = datetime.now().date()
+    now = datetime.now()
+    today_date = now.date()
 
-    # Check existing attendance
-    user_records = get_user_records(userid)
-    for row in reversed(user_records):
-        if row.get('Action') == 'Attendance':
-            try:
-                ts_str = str(row.get('Timestamp', ''))
-                if len(ts_str) >= 10:
-                    row_date = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S").date()
+    # Check if this user already gave attendance today
+    try:
+        records = attendance_sheet.get_all_records()
+        for row in records[::-1]:
+            if str(row['UserID']) == str(userid):
+                try:
+                    row_date = datetime.strptime(str(row['Date']), "%Y-%m-%d %H:%M:%S").date()
                     if row_date == today_date:
-                        return f"⚠️ {username}, attendance already recorded! ✅"
-            except (ValueError, TypeError):
-                continue
+                        return f"⚠️ {username}, your attendance for today is already recorded! ✅"
+                except ValueError:
+                    continue
+    except:
+        pass
 
     # Log new attendance
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    executor.submit(
-        async_append_row,
-        [username, userid, timestamp, "Attendance", "10", "", "", ""]
-    )
-    invalidate_user_cache(userid)  # Invalidate user cache
+    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    attendance_sheet.append_row([username, userid, timestamp])
+    
+    # Update XP
+    update_user_xp(username, userid, 10, "Attendance")
     
     streak = calculate_streak(userid)
-    return f"✅ {username}, attendance logged +10 XP! 🔥 Streak: {streak} days."
+    return f"✅ {username}, your attendance is logged and you earned 10 XP! 🔥 Daily Streak: {streak} days."
+
 
 @app.route("/start")
 def start():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Check existing sessions
-    user_records = get_user_records(userid)
-    for row in reversed(user_records):
-        if row.get('Action') == 'Session Start':
-            return f"⚠️ {username}, session already started. Use `!stop` first."
+    try:
+        records = session_sheet.get_all_records()
+        # Check if a session is already running (not marked as completed)
+        for row in reversed(records):
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Active':
+                return f"⚠️ {username}, you already started a session. Use `!stop` before starting a new one."
+    except:
+        pass
 
-    # Start new session
-    executor.submit(
-        async_append_row,
-        [username, userid, now, "Session Start", "0", "", "", ""]
-    )
-    invalidate_user_cache(userid)  # Invalidate user cache
-    return f"⏱️ {username}, study session started! Use `!stop` to end."
+    # Log new session start
+    session_sheet.append_row([username, userid, now, "", "", "Active"])
+    return f"⏱️ {username}, your study session has started! Use `!stop` to end it. Happy studying 📚"
 
+
+# ✅ !stop
 @app.route("/stop")
 def stop():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
     now = datetime.now()
 
-    # Find latest session start
-    user_records = get_user_records(userid)
-    session_start = None
-    row_index = None
-    
-    for i, row in enumerate(reversed(user_records)):
-        if row.get('Action') == 'Session Start':
-            try:
-                ts_str = str(row.get('Timestamp', ''))
-                if len(ts_str) >= 19:
-                    session_start = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S")
-                    # Calculate original row index (reverse index math)
-                    row_index = len(user_records) - i
+    try:
+        records = session_sheet.get_all_records()
+        
+        # Find the latest active session
+        session_start = None
+        row_index = None
+        for i in range(len(records) - 1, -1, -1):
+            row = records[i]
+            if (str(row['UserID']) == str(userid) and row['Status'] == 'Active'):
+                try:
+                    session_start = datetime.strptime(row['StartTime'], "%Y-%m-%d %H:%M:%S")
+                    row_index = i + 2
                     break
-            except (ValueError, TypeError):
-                continue
+                except ValueError:
+                    continue
 
-    if not session_start:
-        return f"⚠️ {username}, no active session found."
+        if not session_start:
+            return f"⚠️ {username}, you didn't start any session. Use `!start` to begin."
 
-    # Calculate duration and XP
-    duration_minutes = max(1, int((now - session_start).total_seconds() / 60))
-    xp_earned = duration_minutes * 2
+        # Calculate duration and XP
+        duration_minutes = int((now - session_start).total_seconds() / 60)
+        xp_earned = duration_minutes * 2
 
-    # Log session
-    session_data = [
-        username, userid,
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-        "Study Session", str(xp_earned),
-        session_start.strftime("%Y-%m-%d %H:%M:%S"),
-        now.strftime("%Y-%m-%d %H:%M:%S"),
-        f"{duration_minutes} min"
-    ]
-    executor.submit(async_append_row, session_data)
+        # Update the session record
+        session_sheet.update_cell(row_index, 4, now.strftime("%Y-%m-%d %H:%M:%S"))  # EndTime
+        session_sheet.update_cell(row_index, 5, duration_minutes)  # Duration
+        session_sheet.update_cell(row_index, 6, "Completed")  # Status
 
-    # Mark session as completed
-    executor.submit(async_update_cell, row_index + 1, 4, "Session Start ✅")
-    invalidate_user_cache(userid)  # Invalidate user cache
+        # Update XP
+        update_user_xp(username, userid, xp_earned, "Study Session")
 
-    # Check badges
-    badges = get_badges(duration_minutes)
-    badge_msg = f" 🎖 {badges[-1]}!" if badges else ""
+        # Badge check
+        badges = get_badges(duration_minutes)
+        badge_message = f" 🎖 {username}, you unlocked a badge: {badges[-1]}! Keep it up!" if badges else ""
+
+        return f"👩🏻‍💻📓✍🏻 {username}, you studied for {duration_minutes} minutes and earned {xp_earned} XP.{badge_message}"
     
-    return f"👩🏻‍💻 {username}, studied {duration_minutes} min, earned {xp_earned} XP.{badge_msg}"
+    except Exception as e:
+        return f"⚠️ Error stopping session: {str(e)}"
 
+
+# ✅ !rank
 @app.route("/rank")
 def rank():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
 
-    user_records = get_user_records(userid)
-    total_xp = 0
-
-    for row in user_records:
-        try:
-            total_xp += int(row.get('XP', 0))
-        except (ValueError, TypeError):
-            continue
-
+    total_xp = get_user_total_xp(userid)
     user_rank = get_rank(total_xp)
-    return f"🏅 {username}, {total_xp} XP. Rank: {user_rank}"
+    return f"🏅 {username}, you have {total_xp} XP. Your rank is: {user_rank}"
 
+
+# ✅ !top
 @app.route("/top")
 def leaderboard():
-    records = get_cached_records()
-    xp_map = {}
+    try:
+        records = xp_sheet.get_all_records()
+        sorted_users = sorted(records, key=lambda x: int(x.get('TotalXP', 0)), reverse=True)[:5]
+        
+        message = "🏆 Top 5 Learners:\n"
+        for i, user in enumerate(sorted_users, 1):
+            message += f"{i}. {user['Username']} - {user.get('TotalXP', 0)} XP\n"
 
-    for row in records:
-        try:
-            name = row.get('Username', 'Unknown')
-            xp = int(row.get('XP', 0))
-            if name and xp > 0:
-                xp_map[name] = xp_map.get(name, 0) + xp
-        except (ValueError, TypeError):
-            continue
+        return message.strip()
+    except:
+        return "⚠️ Unable to fetch leaderboard data."
 
-    sorted_users = sorted(xp_map.items(), key=lambda x: x[1], reverse=True)[:5]
-    message = "🏆 Top 5 Learners:\n"
-    for i, (user, xp) in enumerate(sorted_users, 1):
-        message += f"{i}. {user} - {xp} XP\n"
 
-    return message.strip()
-
+# ✅ !task
 @app.route("/task")
 def add_task():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
-    msg = request.args.get('msg') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
+    msg = request.args.get('msg')
 
     if not msg or len(msg.strip().split()) < 2:
-        return f"⚠️ {username}, invalid task format."
+        return f"⚠️ {username}, please provide a task like: !task Physics Chapter 1 or !task Studying Math."
 
-    # Check existing tasks
-    user_records = get_user_records(userid)
-    for row in reversed(user_records):
-        action = row.get('Action', '')
-        if action.startswith("Task:") and "✅ Done" not in action:
-            return f"⚠️ {username}, complete previous task first."
+    try:
+        records = task_sheet.get_all_records()
+        for row in records[::-1]:
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+                return f"⚠️ {username}, please complete your previous task first. Use `!done` to mark it as completed."
+    except:
+        pass
 
-    # Add new task
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = msg.strip()
-    executor.submit(
-        async_append_row,
-        [username, userid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), 
-         f"Task: {task_name}", "0", "", "", ""]
-    )
-    invalidate_user_cache(userid)  # Invalidate user cache
-    return f"✏️ {username}, task added: '{task_name}'"
+    task_sheet.append_row([username, userid, task_name, now, "", "Pending"])
+    return f"✏️ {username}, your task '{task_name}' has been added. Study well! Use `!done` to mark it as completed. Use `!remove` to remove it."
 
+
+# ✅ !done
 @app.route("/done")
 def mark_done():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
 
-    # Step 1: Get user's current cached records
-    user_records = get_user_records(userid)
+    try:
+        records = task_sheet.get_all_records()
 
-    # Step 2: Find the last active task
-    for i, row in enumerate(reversed(user_records)):
-        action = row.get('Action', '')
-        if action.startswith("Task:") and "✅ Done" not in action:
-            task_name = action[6:]
-            row_index = len(user_records) - i  # Correct index in the sheet
+        for i in range(len(records) - 1, -1, -1):
+            row = records[i]
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+                row_index = i + 2
+                task_name = row['TaskName']
 
-            # Step 3: Mark the task as done
-            executor.submit(
-                async_update_cell, 
-                row_index + 1, 4, 
-                f"Task: {task_name} ✅ Done"
-            )
+                # Mark task as completed
+                task_sheet.update_cell(row_index, 5, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))  # CompletedDate
+                task_sheet.update_cell(row_index, 6, "Completed")  # Status
 
-            # Step 4: Add XP
-            executor.submit(
-                async_append_row,
-                [username, userid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                 "Task Completed", "15", "", "", ""]
-            )
+                # Update XP
+                xp_earned = 15
+                update_user_xp(username, userid, xp_earned, "Task Completed")
 
-            # Step 5: Invalidate & refresh the cache
-            invalidate_user_cache(userid)
-            refresh_cache()  # ← Force refresh of entire cache
+                return f"✅ {username}, you completed your task '{task_name}' and earned {xp_earned} XP! Great job! 💪"
 
-            return f"✅ {username}, task completed! +15 XP"
+        return f"⚠️ {username}, you don't have any active task. Use `!task Your Task` to add one."
+    except Exception as e:
+        return f"⚠️ Error completing task: {str(e)}"
 
-    return f"⚠️ {username}, no active tasks found."
 
+# ✅ !remove
 @app.route("/remove")
 def remove_task():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
 
-    # Find latest active task
-    user_records = get_user_records(userid)
-    for i, row in enumerate(reversed(user_records)):
-        action = row.get('Action', '')
-        if action.startswith("Task:") and "✅ Done" not in action:
-            row_index = len(user_records) - i
-            task_name = action[6:]
-            
-            try:
-                sheet.delete_rows(row_index + 1)
-                refresh_cache()
-                invalidate_user_cache(userid)
-                return f"🗑️ {username}, task removed."
-            except Exception as e:
-                logger.error(f"Task deletion failed: {str(e)}")
-                return f"⚠️ {username}, task removal failed."
+    try:
+        records = task_sheet.get_all_records()
+        for i in range(len(records) - 1, -1, -1):
+            row = records[i]
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+                row_index = i + 2
+                task_name = row['TaskName']
+                task_sheet.delete_rows(row_index)
+                return f"🗑️ {username}, your task '{task_name}' has been removed. Use `!task Your Task` to add a new one."
 
-    return f"⚠️ {username}, no active tasks to remove."
+        return f"⚠️ {username}, you have no active task to remove. Use `!task Your Task` to add one."
+    except Exception as e:
+        return f"⚠️ Error removing task: {str(e)}"
 
+
+# ✅ !weeklytop
 @app.route("/weeklytop")
 def weekly_top():
-    records = get_cached_records()
-    xp_map = {}
-    one_week_ago = datetime.now() - timedelta(days=7)
+    try:
+        records = xp_sheet.get_all_records()
+        one_week_ago = datetime.now() - timedelta(days=7)
+        
+        weekly_xp = {}
+        for user in records:
+            try:
+                last_updated = datetime.strptime(user['LastUpdated'], "%Y-%m-%d %H:%M:%S")
+                if last_updated >= one_week_ago:
+                    weekly_xp[user['Username']] = int(user.get('TotalXP', 0))
+            except:
+                continue
 
-    for row in records:
-        try:
-            ts_str = str(row.get('Timestamp', ''))
-            if len(ts_str) >= 19:
-                timestamp = datetime.strptime(ts_str[:19], "%Y-%m-%d %H:%M:%S")
-                if timestamp >= one_week_ago:
-                    name = row.get('Username', 'Unknown')
-                    xp = int(row.get('XP', 0))
-                    if name and xp > 0:
-                        xp_map[name] = xp_map.get(name, 0) + xp
-        except (ValueError, TypeError):
-            continue
+        sorted_users = sorted(weekly_xp.items(), key=lambda x: x[1], reverse=True)[:5]
+        message = "📆 Weekly Top 5 Learners:\n"
+        for i, (user, xp) in enumerate(sorted_users, 1):
+            message += f"{i}. {user} - {xp} XP\n"
 
-    sorted_users = sorted(xp_map.items(), key=lambda x: x[1], reverse=True)[:5]
-    message = "📆 Weekly Top 5:\n"
-    for i, (user, xp) in enumerate(sorted_users, 1):
-        message += f"{i}. {user} - {xp} XP\n"
+        return message.strip()
+    except:
+        return "⚠️ Unable to fetch weekly leaderboard data."
 
-    return message.strip()
 
+# ✅ !summary
+@app.route("/summary")
+def summary():
+    username = request.args.get('user')
+    userid = request.args.get('id')
+
+    try:
+        # Get total XP
+        total_xp = get_user_total_xp(userid)
+        
+        # Get total study time from sessions
+        session_records = session_sheet.get_all_records()
+        total_minutes = 0
+        for row in session_records:
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Completed':
+                try:
+                    total_minutes += int(row['Duration'])
+                except ValueError:
+                    pass
+
+        # Get task counts
+        task_records = task_sheet.get_all_records()
+        completed_tasks = 0
+        pending_tasks = 0
+        for row in task_records:
+            if str(row['UserID']) == str(userid):
+                if row['Status'] == 'Completed':
+                    completed_tasks += 1
+                elif row['Status'] == 'Pending':
+                    pending_tasks += 1
+
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        return (f"📊 {username}'s Summary:\n"
+                f"⏱️ Total Study Time: {hours}h {minutes}m\n"
+                f"⚜️ Total XP: {total_xp}\n"
+                f"✅ Completed Tasks: {completed_tasks}\n"
+                f"🕒 Pending Tasks: {pending_tasks}")
+    except Exception as e:
+        return f"⚠️ Error generating summary: {str(e)}"
+
+
+# ✅ !pending
+@app.route("/pending")
+def pending_task():
+    username = request.args.get('user')
+    userid = request.args.get('id')
+
+    try:
+        records = task_sheet.get_all_records()
+        for row in reversed(records):
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+                task_name = row['TaskName']
+                return f"🕒 {username}, your current pending task is: '{task_name}' — Keep going. Use `!done` to mark it as completed. Use `!remove` to remove it."
+
+        return f"✅ {username}, you have no pending tasks! Use `!task Your Task` to add one."
+    except Exception as e:
+        return f"⚠️ Error fetching pending tasks: {str(e)}"
+
+
+# ✅ !comtask
+@app.route("/comtask")
+def completed_tasks():
+    username = request.args.get('user')
+    userid = request.args.get('id')
+
+    try:
+        records = task_sheet.get_all_records()
+        completed = []
+
+        for row in reversed(records):
+            if str(row['UserID']) == str(userid) and row['Status'] == 'Completed':
+                completed.append(row['TaskName'])
+                if len(completed) == 3:
+                    break
+
+        if not completed:
+            return f"📭 {username}, you haven't completed any tasks yet. Use `!task` to add one."
+
+        task_list = "\n".join([f"{i+1}. {task}" for i, task in enumerate(completed)])
+        return f"✅ {username}, here are your last 3 completed tasks:\n{task_list}"
+    except Exception as e:
+        return f"⚠️ Error fetching completed tasks: {str(e)}"
+
+
+# Goal functionality (you can add a separate goal sheet if needed)
 @app.route("/goal")
 def goal():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
     msg = request.args.get('msg') or ""
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    user_records = get_user_records(userid)
     
-    if msg.strip():
-        # Set new goal
-        executor.submit(
-            async_append_row,
-            [username, userid, now, "Set Goal", "0", "", "", "", msg.strip()]
-        )
-        invalidate_user_cache(userid)
-        return f"🎯 {username}, goal set: {msg.strip()}"
-    else:
-        # Show existing goal
-        for row in reversed(user_records):
-            if row.get('Goal'):
-                return f"🎯 {username}, current goal: {row['Goal']}"
-        return f"⚠️ {username}, no goal set."
+    # For now, using task sheet with a special goal task type
+    # You can create a separate goal sheet if needed
+    return f"🎯 Goal functionality - implement with separate goal sheet if needed"
+
 
 @app.route("/complete")
 def complete_goal():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
+    username = request.args.get('user')
+    userid = request.args.get('id')
+    return f"🎉 Goal completion - implement with separate goal sheet if needed"
 
-    user_records = get_user_records(userid)
-    for i, row in enumerate(reversed(user_records)):
-        if row.get('Goal'):
-            row_index = len(user_records) - i
-            executor.submit(
-                async_update_cell, 
-                row_index + 1, 9, 
-                ""
-            )
-            invalidate_user_cache(userid)
-            return f"🎉 {username}, goal achieved!"
-
-    return f"⚠️ {username}, no active goal."
-
-@app.route("/summary")
-def summary():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
-
-    user_records = get_user_records(userid)
-    total_minutes = 0
-    total_xp = 0
-    completed_tasks = 0
-    pending_tasks = 0
-
-    for row in user_records:
-        # XP calculation
-        try:
-            total_xp += int(row.get('XP', 0))
-        except (ValueError, TypeError):
-            pass
-        
-        # Study time
-        if row.get('Action') == "Study Session":
-            try:
-                duration = str(row.get('Duration', '0')).replace("min", "").strip()
-                total_minutes += int(duration) if duration.isdigit() else 0
-            except (ValueError, TypeError):
-                pass
-        
-        # Task counts
-        action = row.get('Action', '')
-        if action.startswith("Task:"):
-            if "✅ Done" in action:
-                completed_tasks += 1
-            else:
-                pending_tasks += 1
-
-    hours = total_minutes // 60
-    minutes = total_minutes % 60
-    return (f"📊 {username}'s Summary:\n"
-            f"⏱️ Total Study Time: {hours}h {minutes}m\n"
-            f"⚜️ Total XP: {total_xp}\n"
-            f"✅ Completed Tasks: {completed_tasks}\n"
-            f"🕒 Pending Tasks: {pending_tasks}")
-
-@app.route("/pending")
-def pending_task():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
-
-    user_records = get_user_records(userid)
-    for row in reversed(user_records):
-        action = row.get('Action', '')
-        if action.startswith("Task:") and "✅ Done" not in action:
-            return f"🕒 {username}, current task: '{action[6:]}'"
-
-    return f"✅ {username}, no pending tasks!"
-
-@app.route("/comtask")
-def completed_tasks():
-    username = request.args.get('user') or ""
-    userid = request.args.get('id') or ""
-
-    user_records = get_user_records(userid)
-    completed = []
-    
-    for row in reversed(user_records):
-        action = row.get('Action', '')
-        if action.startswith("Task:") and "✅ Done" in action:
-            task_name = action[6:].replace("✅ Done", "").strip()
-            completed.append(task_name)
-            if len(completed) >= 3:
-                break
-
-    if not completed:
-        return f"📭 {username}, no completed tasks."
-
-    task_list = "\n".join([f"{i+1}. {task}" for i, task in enumerate(completed)])
-    return f"✅ {username}'s completed tasks:\n{task_list}"
 
 @app.route("/ping")
 def ping():
-    try:
-        # Quick sheet access test
-        sheet.row_count
-        return "🟢 Server & Sheets Connected"
-    except Exception as e:
-        return f"🔴 Connection Error: {str(e)}"
+    return "🟢 Sunnie-BOT is alive!"
 
-# === Initialization ===
+
+# === Run Server ===
 if __name__ == "__main__":
-    # Initial cache load
-    refresh_cache()
-    app.run(host="0.0.0.0", port=8080, threaded=True)
+    app.run(host="0.0.0.0", port=8080)
