@@ -23,6 +23,15 @@ session_sheet = spreadsheet.worksheet("session")
 task_sheet = spreadsheet.worksheet("task")
 xp_sheet = spreadsheet.worksheet("xp")
 
+# Add goal sheet - make sure this sheet exists in your Google Sheet
+# Sheet should have columns: Username, UserID, GoalName, CreatedDate, CompletedDate, Status
+try:
+    goal_sheet = spreadsheet.worksheet("goal")
+except:
+    # If goal sheet doesn't exist, create it
+    goal_sheet = spreadsheet.add_worksheet(title="goal", rows="1000", cols="6")
+    goal_sheet.append_row(["Username", "UserID", "GoalName", "CreatedDate", "CompletedDate", "Status"])
+
 # === Helper Functions ===
 def update_user_xp(username, userid, xp_earned, action_type):
     """Update or create user XP record in the xp sheet"""
@@ -386,13 +395,26 @@ def summary():
                 elif row['Status'] == 'Pending':
                     pending_tasks += 1
 
+        # Get goal counts
+        goal_records = goal_sheet.get_all_records()
+        completed_goals = 0
+        pending_goals = 0
+        for row in goal_records:
+            if str(row.get('UserID', '')) == str(userid):
+                if row.get('Status', '') == 'Completed':
+                    completed_goals += 1
+                elif row.get('Status', '') == 'Pending':
+                    pending_goals += 1
+
         hours = total_minutes // 60
         minutes = total_minutes % 60
         return (f"📊 {username}'s Summary:\n"
                 f"⏱️ Total Study Time: {hours}h {minutes}m\n"
                 f"⚜️ Total XP: {total_xp}\n"
                 f"✅ Completed Tasks: {completed_tasks}\n"
-                f"🕒 Pending Tasks: {pending_tasks}")
+                f"🕒 Pending Tasks: {pending_tasks}\n"
+                f"🎯 Completed Goals: {completed_goals}\n"
+                f"🎪 Pending Goals: {pending_goals}")
     except Exception as e:
         return f"⚠️ Error generating summary: {str(e)}"
 
@@ -440,23 +462,59 @@ def completed_tasks():
         return f"⚠️ Error fetching completed tasks: {str(e)}"
 
 
-# Goal functionality (you can add a separate goal sheet if needed)
+# ✅ !goal - NEW GOAL FUNCTIONALITY
 @app.route("/goal")
 def goal():
     username = request.args.get('user')
     userid = request.args.get('id')
-    msg = request.args.get('msg') or ""
+    msg = request.args.get('msg')
     
-    # For now, using task sheet with a special goal task type
-    # You can create a separate goal sheet if needed
-    return f"🎯 Goal functionality - implement with separate goal sheet if needed"
+    if not msg or len(msg.strip().split()) < 2:
+        return f"⚠️ {username}, please provide a goal like: !goal Complete Math Course or !goal Read 5 Books."
+
+    try:
+        records = goal_sheet.get_all_records()
+        # Check if user already has an active goal
+        for row in records[::-1]:
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Pending':
+                return f"⚠️ {username}, please complete your previous goal first. Use `!complete` to mark it as completed."
+    except Exception as e:
+        print(f"Error checking goals: {e}")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    goal_name = msg.strip()
+    goal_sheet.append_row([username, userid, goal_name, now, "", "Pending"])
+    return f"🎯 {username}, your goal '{goal_name}' has been set! Work towards it and use `!complete` when you achieve it. You'll earn 25 XP! 💪"
 
 
+# ✅ !complete - COMPLETE GOAL FUNCTIONALITY
 @app.route("/complete")
 def complete_goal():
     username = request.args.get('user')
     userid = request.args.get('id')
-    return f"🎉 Goal completion - implement with separate goal sheet if needed"
+
+    try:
+        records = goal_sheet.get_all_records()
+
+        for i in range(len(records) - 1, -1, -1):
+            row = records[i]
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Pending':
+                row_index = i + 2
+                goal_name = row.get('GoalName', '')
+
+                # Mark goal as completed
+                goal_sheet.update_cell(row_index, 5, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))  # CompletedDate
+                goal_sheet.update_cell(row_index, 6, "Completed")  # Status
+
+                # Update XP - Goals give 25 XP
+                xp_earned = 25
+                update_user_xp(username, userid, xp_earned, "Goal Completed")
+
+                return f"🎉 {username}, congratulations! You completed your goal '{goal_name}' and earned {xp_earned} XP! Amazing achievement! 🏆✨"
+
+        return f"⚠️ {username}, you don't have any active goal. Use `!goal Your Goal` to set one."
+    except Exception as e:
+        return f"⚠️ Error completing goal: {str(e)}"
 
 
 @app.route("/ping")
