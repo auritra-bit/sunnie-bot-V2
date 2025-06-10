@@ -168,10 +168,10 @@ def start():
         records = session_sheet.get_all_records()
         # Check if a session is already running (not marked as completed)
         for row in reversed(records):
-            if str(row['UserID']) == str(userid) and row['Status'] == 'Active':
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Active':
                 return f"⚠️ {username}, you already started a session. Use `!stop` before starting a new one."
-    except:
-        pass
+    except Exception as e:
+        print(f"Error checking sessions: {e}")
 
     # Log new session start
     session_sheet.append_row([username, userid, now, "", "", "Active"])
@@ -193,12 +193,13 @@ def stop():
         row_index = None
         for i in range(len(records) - 1, -1, -1):
             row = records[i]
-            if (str(row['UserID']) == str(userid) and row['Status'] == 'Active'):
+            if (str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Active'):
                 try:
-                    session_start = datetime.strptime(row['StartTime'], "%Y-%m-%d %H:%M:%S")
+                    session_start = datetime.strptime(row.get('StartTime', ''), "%Y-%m-%d %H:%M:%S")
                     row_index = i + 2
                     break
-                except ValueError:
+                except (ValueError, TypeError):
+                    print(f"Error parsing start time: {row.get('StartTime', '')}")
                     continue
 
         if not session_start:
@@ -266,10 +267,10 @@ def add_task():
     try:
         records = task_sheet.get_all_records()
         for row in records[::-1]:
-            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Pending':
                 return f"⚠️ {username}, please complete your previous task first. Use `!done` to mark it as completed."
-    except:
-        pass
+    except Exception as e:
+        print(f"Error checking tasks: {e}")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     task_name = msg.strip()
@@ -288,9 +289,9 @@ def mark_done():
 
         for i in range(len(records) - 1, -1, -1):
             row = records[i]
-            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Pending':
                 row_index = i + 2
-                task_name = row['TaskName']
+                task_name = row.get('TaskName', '')
 
                 # Mark task as completed
                 task_sheet.update_cell(row_index, 5, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))  # CompletedDate
@@ -317,9 +318,9 @@ def remove_task():
         records = task_sheet.get_all_records()
         for i in range(len(records) - 1, -1, -1):
             row = records[i]
-            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Pending':
                 row_index = i + 2
-                task_name = row['TaskName']
+                task_name = row.get('TaskName', '')
                 task_sheet.delete_rows(row_index)
                 return f"🗑️ {username}, your task '{task_name}' has been removed. Use `!task Your Task` to add a new one."
 
@@ -405,8 +406,8 @@ def pending_task():
     try:
         records = task_sheet.get_all_records()
         for row in reversed(records):
-            if str(row['UserID']) == str(userid) and row['Status'] == 'Pending':
-                task_name = row['TaskName']
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Pending':
+                task_name = row.get('TaskName', '')
                 return f"🕒 {username}, your current pending task is: '{task_name}' — Keep going. Use `!done` to mark it as completed. Use `!remove` to remove it."
 
         return f"✅ {username}, you have no pending tasks! Use `!task Your Task` to add one."
@@ -425,8 +426,8 @@ def completed_tasks():
         completed = []
 
         for row in reversed(records):
-            if str(row['UserID']) == str(userid) and row['Status'] == 'Completed':
-                completed.append(row['TaskName'])
+            if str(row.get('UserID', '')) == str(userid) and str(row.get('Status', '')).strip() == 'Completed':
+                completed.append(row.get('TaskName', ''))
                 if len(completed) == 3:
                     break
 
